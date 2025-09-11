@@ -291,6 +291,7 @@ def scan_top_cryptos(limit=5):
                     "symbol": symbol,
                     "score": score
                 })
+                print(f"🔬 {symbol} — Score: {score} | EMA Slope: {ema_slope:.4f} | RSI: {latest_rsi:.2f} | Volatility: {volatility:.4f}")
             except Exception as inner_e:
                 print(f"⚠️ Error scoring {symbol}: {inner_e}")
                 continue
@@ -307,9 +308,11 @@ def scan_top_cryptos(limit=5):
 # === Main Bot Loop ===
 def run_bot():
     print("🔁 Starting OMEGA-VX-CRYPTO bot loop...")
+    send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
             pairs = scan_top_cryptos()
+            send_telegram_alert(f"🧠 Scanned top cryptos: {pairs}")
             for symbol in pairs:
                 print(f"📈 Evaluating {symbol}...")
 
@@ -350,7 +353,7 @@ def run_bot():
             monitor_positions()
             log_portfolio_snapshot()
             print("📌 Current open positions:", open_positions)
-            time.sleep(60)  # Run every 60 seconds
+            time.sleep(15)  # Reduced sleep for faster log testing
         except Exception as e:
             send_telegram_alert(f"🚨 Bot error: {str(e)}")
             time.sleep(60)
