@@ -74,7 +74,6 @@ kraken = ccxt.kraken({
     'enableRateLimit': True
 })
 
-# === Placeholder for Telegram Alert Function ===
 def send_telegram_alert(message):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -138,7 +137,6 @@ def log_portfolio_snapshot():
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
-# === Placeholder for Trade Execution ===
 def execute_trade(symbol, side, amount, price=None):
     # Prevent duplicate buys or trades within cooldown window
     now = time.time()
@@ -334,14 +332,13 @@ def run_bot():
 
                     print(f"✅ {symbol} passed filters. Ready for trade logic.")
 
-                    # === Place Market Buy Trade ===
                     try:
                         market = kraken.market(symbol)
                         price = closes[-1]
                         precision = market['precision']['amount'] or 6
                         amount = round(trade_amount_usd / price, precision)
 
-                        print(f"🛒 Executing test BUY for {symbol} at ${price:.2f}, amount={amount}")
+                        print(f"🛒 Executing LIVE BUY for {symbol} at ${price:.2f}, amount={amount}")
                         execute_trade(symbol, "buy", amount)
 
                     except Exception as trade_error:
