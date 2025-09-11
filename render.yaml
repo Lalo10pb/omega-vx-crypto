@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: omega-vx-crypto
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: ./start.sh
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: 7559255840:AAG4gikmYWhTN4pTHkrgdTTwan07l0FJz_Q
+      - key: TELEGRAM_CHAT_ID
+        value: 8248033539
+      - key: KRAKEN_API_KEY
+        value: uJy32hCnJ1LGOzEplDixZNGRUPWMhCf2cA81W4bqLmxZoDXyp0YZknQx
+      - key: KRAKEN_SECRET_KEY
+        value: lkO0e54lkJGOsxoIGqiKY0K8I2CWgLLWb7M7Xn+GG/34oR7pMY/Pzbf56LuNhkIwHQ3JOu5VcSaKjomRQGW7rA==
+      - key: GOOGLE_SHEET_ID
+        value: 1Mi41KWJO6oJxTSJUEfiVslPIM_DEsX39-77_2d5ugMw
+      - key: PORTFOLIO_SHEET_NAME
+        value: Portfolio Log
+      - key: TRADE_SHEET_NAME
+        value: Trade Log
