@@ -1,6 +1,6 @@
 services:
-  - type: web
-    name: omega-vx-crypto
+  - type: worker
+    name: omega-vx-crypto-worker
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: ./start.sh
@@ -16,6 +16,6 @@ services:
       - key: GOOGLE_SHEET_ID
         value: 1Mi41KWJO6oJxTSJUEfiVslPIM_DEsX39-77_2d5ugMw
       - key: PORTFOLIO_SHEET_NAME
-        value: Portfolio Log
+        value: Crypto Portfolio Log
       - key: TRADE_SHEET_NAME
-        value: Trade Log
+        value: Crypto Trade Log
