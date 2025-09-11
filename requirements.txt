@@ -1,0 +1,6 @@
+ccxt
+python-dotenv
+numpy
+requests
+gspread
+oauth2client
