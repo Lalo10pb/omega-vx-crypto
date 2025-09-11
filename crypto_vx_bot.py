@@ -335,7 +335,7 @@ def run_bot():
                     try:
                         market = kraken.market(symbol)
                         price = closes[-1]
-                        precision = market['precision']['amount'] or 6
+                        precision = int(market['precision'].get('amount', 6) or 6)
                         amount = round(trade_amount_usd / price, precision)
 
                         print(f"🛒 Executing LIVE BUY for {symbol} at ${price:.2f}, amount={amount}")
