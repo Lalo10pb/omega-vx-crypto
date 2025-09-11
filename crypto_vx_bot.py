@@ -1,6 +1,7 @@
 import ccxt
 import os
 import time
+from collections import defaultdict
 from dotenv import load_dotenv
 import numpy as np
 import requests
@@ -8,6 +9,13 @@ import csv
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+print("🟢 OMEGA-VX-CRYPTO bot started.")
+open_positions = set()
+open_positions_data = {}
+last_buy_time = defaultdict(lambda: 0)
+last_trade_time = defaultdict(lambda: 0)
+COOLDOWN_SECONDS = 30 * 60  # 30 minutes
+TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
 
  # === CONFIGURATION ===
 trade_amount_usd = 5  # USD amount per trade (adjust as needed)
@@ -132,10 +140,35 @@ def log_portfolio_snapshot():
 
 # === Placeholder for Trade Execution ===
 def execute_trade(symbol, side, amount, price=None):
+    # Prevent duplicate buys or trades within cooldown window
+    now = time.time()
+    # Apply global cooldown for both buy/sell
+    if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
+        wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
+        reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
+        print(reason)
+        send_telegram_alert(reason)
+        return
+    if side == "buy":
+        if symbol in open_positions:
+            reason = f"⛔ Trade rejected: {symbol} is already in open_positions."
+            print(reason)
+            send_telegram_alert(reason)
+            return
+        if now - last_buy_time[symbol] < COOLDOWN_SECONDS:
+            wait_time = int(COOLDOWN_SECONDS - (now - last_buy_time[symbol])) // 60
+            reason = f"⏳ Trade rejected: cooldown active for {symbol} ({wait_time} min remaining)."
+            print(reason)
+            send_telegram_alert(reason)
+            return
     try:
         order = kraken.create_market_order(symbol, side, amount)
         send_telegram_alert(f"✅ {side.upper()} order executed for {symbol} | Amount: {amount}")
+        last_trade_time[symbol] = now
         log_trade(symbol, side, amount, order['price'] if 'price' in order else 'MKT', "manual trade")
+        if side == "buy":
+            open_positions.add(symbol)
+            last_buy_time[symbol] = time.time()
         return order
     except Exception as e:
         send_telegram_alert(f"❌ Failed to execute {side} order for {symbol}: {str(e)}")
@@ -147,56 +180,82 @@ hard_stop_pct = 3.0      # hard SL
 
 # === Monitor & Auto-Close Open Positions ===
 def monitor_positions():
-    print("🔍 Checking open positions...")
+    print("🔍 Monitoring live positions...")
     try:
-        open_orders = kraken.fetch_open_orders()
-        positions = {}  # track entry prices per symbol
+        balance = kraken.fetch_balance()
+        tickers = kraken.fetch_tickers()
 
-        for order in open_orders:
-            symbol = order['symbol']
-            side = order['side']
-            filled = order['filled']
-            price = order['average'] or order['price']
+        for symbol, market_data in tickers.items():
+            if "/USD" not in symbol:
+                continue
 
-            if side == "buy" and filled > 0:
-                ticker = kraken.fetch_ticker(symbol)
-                current_price = ticker['last']
-                change_pct = ((current_price - price) / price) * 100
+            market = kraken.market(symbol)
+            base = market['base']
+            quote = market['quote']
 
-                print(f"🔎 {symbol}: entry=${price:.2f} → now=${current_price:.2f} ({change_pct:.2f}%)")
+            if quote != 'USD' or base not in balance or balance[base]['total'] == 0:
+                continue
 
-                # Take Profit
-                if change_pct >= take_profit_pct:
-                    kraken.create_market_order(symbol, "sell", filled)
-                    log_trade(symbol, "sell", filled, current_price, "take profit")
-                    send_telegram_alert(f"🎯 TAKE PROFIT: Sold {symbol} at {current_price:.2f} (+{change_pct:.2f}%)")
-                    continue
+            amount_held = balance[base]['total']
+            current_price = market_data['last']
 
-                # Hard Stop Loss
-                if change_pct <= -hard_stop_pct:
-                    kraken.create_market_order(symbol, "sell", filled)
-                    log_trade(symbol, "sell", filled, current_price, "hard stop")
-                    send_telegram_alert(f"🛑 HARD STOP: Sold {symbol} at {current_price:.2f} ({change_pct:.2f}%)")
-                    continue
+            # Fetch latest buy trade as pseudo-entry price
+            entry_price = None
+            try:
+                trades = kraken.fetch_my_trades(symbol)
+                buys = [t for t in trades if t['side'] == 'buy']
+                if buys:
+                    entry_price = buys[-1]['price']
+            except Exception as e:
+                send_telegram_alert(f"⚠️ Trade history error for {symbol}: {e}")
+                continue
 
-                # Trailing Stop
-                if symbol not in positions:
-                    positions[symbol] = {
-                        'entry': price,
-                        'peak': current_price
-                    }
+            if not entry_price:
+                continue
 
-                else:
-                    if current_price > positions[symbol]['peak']:
-                        positions[symbol]['peak'] = current_price
+            change_pct = ((current_price - entry_price) / entry_price) * 100
+            print(f"📊 {symbol}: entry=${entry_price:.2f}, now=${current_price:.2f}, Δ={change_pct:.2f}%")
 
-                    drop_pct = ((positions[symbol]['peak'] - current_price) / positions[symbol]['peak']) * 100
-                    if drop_pct >= trailing_stop_pct:
-                        kraken.create_market_order(symbol, "sell", filled)
-                        log_trade(symbol, "sell", filled, current_price, "trailing stop")
-                        send_telegram_alert(f"🔻 TRAILING STOP: Sold {symbol} at {current_price:.2f} (-{drop_pct:.2f}% from peak)")
+            # TAKE PROFIT
+            if change_pct >= take_profit_pct:
+                kraken.create_market_order(symbol, "sell", amount_held)
+                log_trade(symbol, "sell", amount_held, current_price, "take profit")
+                send_telegram_alert(f"🎯 TAKE PROFIT: Sold {symbol} at ${current_price:.2f} (+{change_pct:.2f}%)")
+                open_positions.discard(symbol)
+                open_positions_data.pop(symbol, None)
+                continue
+
+            # HARD STOP
+            if change_pct <= -hard_stop_pct:
+                kraken.create_market_order(symbol, "sell", amount_held)
+                log_trade(symbol, "sell", amount_held, current_price, "hard stop")
+                send_telegram_alert(f"🛑 HARD STOP: Sold {symbol} at ${current_price:.2f} ({change_pct:.2f}%)")
+                open_positions.discard(symbol)
+                open_positions_data.pop(symbol, None)
+                continue
+
+            # TRAILING STOP
+            if symbol not in open_positions_data:
+                open_positions_data[symbol] = {
+                    'entry': entry_price,
+                    'peak': current_price
+                }
+            else:
+                if current_price > open_positions_data[symbol]['peak']:
+                    open_positions_data[symbol]['peak'] = current_price
+
+                peak = open_positions_data[symbol]['peak']
+                drop_pct = ((peak - current_price) / peak) * 100
+
+                if drop_pct >= trailing_stop_pct:
+                    kraken.create_market_order(symbol, "sell", amount_held)
+                    log_trade(symbol, "sell", amount_held, current_price, "trailing stop")
+                    send_telegram_alert(f"🔻 TRAILING STOP: Sold {symbol} at ${current_price:.2f} (-{drop_pct:.2f}% from peak)")
+                    open_positions.discard(symbol)
+                    open_positions_data.pop(symbol, None)
+
     except Exception as e:
-        send_telegram_alert(f"⚠️ Auto-sell monitor error: {str(e)}")
+        send_telegram_alert(f"❌ monitor_positions() error: {e}")
 
 # === Improved Coin Scanner ===
 def scan_top_cryptos(limit=5):
@@ -261,11 +320,13 @@ def run_bot():
                     ema_values = calculate_ema(closes, period=20)
                     if closes[-1] < ema_values[-1]:
                         print(f"⛔ {symbol} rejected: price below EMA.")
+                        send_telegram_alert(f"⛔ {symbol} rejected: price below EMA.")
                         continue
 
                     rsi_values = calculate_rsi(closes, period=14)
                     if rsi_values[-1] < 50:
                         print(f"⛔ {symbol} rejected: RSI below 50.")
+                        send_telegram_alert(f"⛔ {symbol} rejected: RSI below 50.")
                         continue
 
                     print(f"✅ {symbol} passed filters. Ready for trade logic.")
@@ -288,10 +349,16 @@ def run_bot():
 
             monitor_positions()
             log_portfolio_snapshot()
+            print("📌 Current open positions:", open_positions)
             time.sleep(60)  # Run every 60 seconds
         except Exception as e:
             send_telegram_alert(f"🚨 Bot error: {str(e)}")
             time.sleep(60)
 
 if __name__ == "__main__":
-    run_bot()
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped manually.")
+    except Exception as e:
+        send_telegram_alert(f"🚨 Uncaught error in main loop: {str(e)}")
