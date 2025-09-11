@@ -160,7 +160,7 @@ def execute_trade(symbol, side, amount, price=None):
             send_telegram_alert(reason)
             return
     try:
-        order = kraken.create_market_order(symbol, side, amount)
+        order = kraken.create_market_order(symbol, side, float(amount))
         send_telegram_alert(f"✅ {side.upper()} order executed for {symbol} | Amount: {amount}")
         last_trade_time[symbol] = now
         log_trade(symbol, side, amount, order['price'] if 'price' in order else 'MKT', "manual trade")
