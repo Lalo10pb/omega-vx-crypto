@@ -18,7 +18,7 @@ COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
 
  # === CONFIGURATION ===
-trade_amount_usd = 5  # USD amount per trade (adjust as needed)
+trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
 
 # === Paths ===
 TRADE_LOG_PATH = "crypto_trade_log.csv"
