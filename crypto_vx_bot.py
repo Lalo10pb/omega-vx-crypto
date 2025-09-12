@@ -99,6 +99,8 @@ def log_trade(symbol, side, amount, price, reason):
     # Log to local CSV
     with open(TRADE_LOG_PATH, mode='a', newline='') as file:
         writer = csv.writer(file)
+        if file.tell() == 0:
+            writer.writerow(["Timestamp", "Symbol", "Side", "Amount", "Price", "Reason"])
         writer.writerow(row)
 
     # Log to Google Sheet
