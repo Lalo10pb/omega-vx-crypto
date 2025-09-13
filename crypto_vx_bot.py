@@ -109,10 +109,12 @@ def log_trade(symbol, side, amount, price, reason):
     try:
         client = get_gspread_client()
         if client:
-            sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID")).worksheet(os.getenv("TRADE_SHEET_NAME"))
-            sheet.append_row(row)
+            sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
+            trade_tab = os.getenv("TRADE_SHEET_NAME", "Crypto Trade Log")
+            worksheet = sheet.worksheet(trade_tab)
+            worksheet.append_row(row)
     except Exception as e:
-        send_telegram_alert(f"⚠️ Failed to log trade to sheet: {str(e)}")
+        send_telegram_alert(f"⚠️ Failed to log trade to Google Sheet tab '{trade_tab}': {str(e)}")
 
     send_telegram_alert(f"📒 LOGGED TRADE: {side.upper()} {symbol} | Amount: {amount} @ ${price:.2f} ({reason})")
 
