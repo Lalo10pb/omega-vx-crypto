@@ -9,6 +9,7 @@ import csv
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
 print("🟢 OMEGA-VX-CRYPTO bot started.")
 open_positions = set()
 open_positions_data = {}
@@ -18,7 +19,7 @@ COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
 
  # === CONFIGURATION ===
-trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
+# trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
 
 # === Paths ===
 TRADE_LOG_PATH = "crypto_trade_log.csv"
@@ -94,6 +95,7 @@ def send_telegram_alert(message):
 
 def log_trade(symbol, side, amount, price, reason):
     timestamp = datetime.now().isoformat()
+    # Enforce column order: ["Timestamp", "Symbol", "Side", "Amount", "Price", "Reason"]
     row = [timestamp, symbol, side, amount, price, reason]
 
     # Log to local CSV
@@ -174,9 +176,9 @@ def execute_trade(symbol, side, amount, price=None):
         send_telegram_alert(f"❌ Failed to execute {side} order for {symbol}: {str(e)}")
 
 # === SELL LOGIC CONFIG ===
-trailing_stop_pct = 2.5  # percent drawdown from peak after entry
-take_profit_pct = 4.0    # hard TP
-hard_stop_pct = 3.0      # hard SL
+trailing_stop_pct = 4.5  # widened to reduce false exits from micro swings
+take_profit_pct = 6.0    # increased target to capture stronger breakouts
+hard_stop_pct = 4.0      # allows slightly more downside to avoid noise
 
 # === Monitor & Auto-Close Open Positions ===
 def monitor_positions():
@@ -272,13 +274,32 @@ def scan_top_cryptos(limit=5):
                 ohlcv = kraken.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 closes = [candle[4] for candle in ohlcv]
 
+                # Filter: Require at least 1% spread in last 12 closes
+                min_price = min(closes[-12:])
+                max_price = max(closes[-12:])
+                spread_pct = ((max_price - min_price) / min_price) * 100
+                if spread_pct < 1.0:
+                    print(f"⛔ {symbol} rejected: spread too low ({spread_pct:.2f}%)")
+                    continue
+
+                # Filter: Require 1h USD quote volume >= 50k
+                try:
+                    ticker = kraken.fetch_ticker(symbol)
+                    volume_usd = ticker['quoteVolume']
+                    if volume_usd is None or volume_usd < 50000:
+                        print(f"⛔ {symbol} rejected: low volume (${volume_usd:.0f})")
+                        continue
+                except Exception as vol_err:
+                    print(f"⚠️ Volume fetch error for {symbol}: {vol_err}")
+                    continue
+
+                # Scoring logic
                 ema_values = calculate_ema(closes, period=20)
                 ema_slope = ema_values[-1] - ema_values[-5] if len(ema_values) > 5 else 0
                 rsi_values = calculate_rsi(closes, period=14)
                 latest_rsi = rsi_values[-1] if rsi_values else 0
                 volatility = np.std(closes[-10:]) / np.mean(closes[-10:]) if len(closes) > 10 else 0
 
-                # Scoring logic
                 score = 0
                 if ema_slope > 0:
                     score += 1
@@ -311,6 +332,16 @@ def run_bot():
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
+            # Dynamically determine trade size based on available USD balance
+            try:
+                balance = kraken.fetch_balance()
+                usd_available = balance['USD']['free']
+                trade_amount_usd = round(usd_available * 0.05, 2)
+                print(f"💰 Dynamic trade amount: ${trade_amount_usd}")
+            except Exception as e:
+                send_telegram_alert(f"⚠️ Failed to fetch USD balance: {e}")
+                trade_amount_usd = 25  # fallback default
+
             pairs = scan_top_cryptos()
             send_telegram_alert(f"🧠 Scanned top cryptos: {pairs}")
             for symbol in pairs:
@@ -351,11 +382,95 @@ def run_bot():
 
             monitor_positions()
             log_portfolio_snapshot()
+            summarize_daily_pnl()
+            # Weekly PnL summary every Sunday at 5:00 PM (trigger if minute < 5)
+            now_dt = datetime.now()
+            if now_dt.weekday() == 6 and now_dt.hour == 17 and now_dt.minute < 5:
+                summarize_weekly_pnl()
             print("📌 Current open positions:", open_positions)
             time.sleep(15)  # Reduced sleep for faster log testing
         except Exception as e:
             send_telegram_alert(f"🚨 Bot error: {str(e)}")
             time.sleep(60)
+
+# === Daily PnL Summary ===
+def summarize_daily_pnl():
+    try:
+        df = pd.read_csv(TRADE_LOG_PATH)
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['Date'] = df['Timestamp'].dt.date
+
+        grouped = df.groupby(['Date', 'Symbol', 'Side'])[['Amount', 'Price']].agg(list).reset_index()
+        summary = {}
+
+        for _, row in grouped.iterrows():
+            key = (row['Date'], row['Symbol'])
+            if key not in summary:
+                summary[key] = {'buy': [], 'sell': []}
+            summary[key][row['Side']].append((row['Amount'], row['Price']))
+
+        messages = []
+        for (day, symbol), sides in summary.items():
+            if sides['buy'] and sides['sell']:
+                buy_total = sum(a * p for a, p in sides['buy'])
+                sell_total = sum(a * p for a, p in sides['sell'])
+                pnl = sell_total - buy_total
+                messages.append(f"{day} {symbol}: PnL ${pnl:.2f}")
+
+        if messages:
+            send_telegram_alert("📊 DAILY TRADE SUMMARY:\n" + "\n".join(messages))
+
+        # Log to Google Sheet tab: VX-C Daily PnL
+        try:
+            client = get_gspread_client()
+            if client:
+                sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
+                try:
+                    daily_tab = sheet.worksheet("VX-C Daily PnL")
+                except:
+                    daily_tab = sheet.add_worksheet(title="VX-C Daily PnL", rows="1000", cols="5")
+                    daily_tab.append_row(["Date", "Symbol", "PnL", "Asset Type"])
+                for (day, symbol), sides in summary.items():
+                    if sides['buy'] and sides['sell']:
+                        buy_total = sum(a * p for a, p in sides['buy'])
+                        sell_total = sum(a * p for a, p in sides['sell'])
+                        pnl = sell_total - buy_total
+                        daily_tab.append_row([str(day), symbol, round(pnl, 2), "crypto"])
+        except Exception as sheet_err:
+            send_telegram_alert(f"⚠️ Failed to log VX-C Daily PnL to sheet: {sheet_err}")
+    except Exception as e:
+        send_telegram_alert(f"⚠️ Failed to summarize PnL: {str(e)}")
+
+def summarize_weekly_pnl():
+    try:
+        df = pd.read_csv(TRADE_LOG_PATH)
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['Week'] = df['Timestamp'].dt.to_period('W').astype(str)
+
+        df['SignedAmount'] = df.apply(lambda row: row['Amount'] * row['Price'] if row['Side'] == 'sell' else -row['Amount'] * row['Price'], axis=1)
+        summary = df.groupby('Week')['SignedAmount'].sum().reset_index()
+        summary.columns = ['Week', 'Net PnL']
+
+        lines = [f"{row['Week']}: ${row['Net PnL']:.2f}" for _, row in summary.iterrows()]
+        if lines:
+            send_telegram_alert("📆 WEEKLY PNL SUMMARY:\n" + "\n".join(lines))
+
+        # Log to Google Sheet tab: VX-C Weekly PnL
+        try:
+            client = get_gspread_client()
+            if client:
+                sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
+                try:
+                    weekly_tab = sheet.worksheet("VX-C Weekly PnL")
+                except:
+                    weekly_tab = sheet.add_worksheet(title="VX-C Weekly PnL", rows="1000", cols="3")
+                    weekly_tab.append_row(["Week", "Net PnL", "Asset Type"])
+                for _, row in summary.iterrows():
+                    weekly_tab.append_row([row['Week'], round(row['Net PnL'], 2), "crypto"])
+        except Exception as sheet_err:
+            send_telegram_alert(f"⚠️ Failed to log VX-C Weekly PnL to sheet: {sheet_err}")
+    except Exception as e:
+        send_telegram_alert(f"⚠️ Failed to summarize weekly PnL: {str(e)}")
 
 if __name__ == "__main__":
     try:
