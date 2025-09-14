@@ -23,6 +23,7 @@ TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
 
 # === Paths ===
 TRADE_LOG_PATH = "crypto_trade_log.csv"
+TRADE_LOG_PATH_BACKUP = "crypto_trade_log_backup.csv"
 PORTFOLIO_LOG_PATH = "crypto_portfolio_log.csv"
 
 # === Helper Functions for EMA and RSI ===
@@ -105,6 +106,13 @@ def log_trade(symbol, side, amount, price, reason):
             writer.writerow(["Timestamp", "Symbol", "Side", "Amount", "Price", "Reason"])
         writer.writerow(row)
 
+    # Log to backup CSV
+    with open(TRADE_LOG_PATH_BACKUP, mode='a', newline='') as backup_file:
+        backup_writer = csv.writer(backup_file)
+        if backup_file.tell() == 0:
+            backup_writer.writerow(["Timestamp", "Symbol", "Side", "Amount", "Price", "Reason"])
+        backup_writer.writerow(row)
+
     # Log to Google Sheet
     try:
         client = get_gspread_client()
@@ -129,6 +137,10 @@ def log_portfolio_snapshot():
         with open(PORTFOLIO_LOG_PATH, mode='a', newline='') as file:
             writer = csv.writer(file)
             writer.writerow([timestamp, usd, total])
+            # Also write to backup CSV
+            with open("crypto_portfolio_log_backup.csv", mode='a', newline='') as backup_file:
+                backup_writer = csv.writer(backup_file)
+                backup_writer.writerow([timestamp, usd, total])
 
         # Log to Google Sheet
         try:
