@@ -10,6 +10,7 @@ from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
+import datetime
 print("🟢 OMEGA-VX-CRYPTO bot started.")
 open_positions = set()
 open_positions_data = {}
@@ -154,6 +155,25 @@ def log_portfolio_snapshot():
                 sheet.append_row([timestamp, usd, total])
         except Exception as sheet_err:
             send_telegram_alert(f"⚠️ Failed to log portfolio to sheet: {str(sheet_err)}")
+
+        # --- Daily PnL summary logic ---
+        def summarize_daily_pnl(equity_log_file="logs/equity_log.csv"):
+            try:
+                df = pd.read_csv(equity_log_file)
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                today = datetime.datetime.now().date()
+                daily_logs = df[df["timestamp"].dt.date == today]
+                if len(daily_logs) >= 2:
+                    start_value = daily_logs.iloc[0]["portfolio_value"]
+                    end_value = daily_logs.iloc[-1]["portfolio_value"]
+                    change = end_value - start_value
+                    pct_change = (change / start_value) * 100
+                    return f"📈 Daily P&L: ${change:.2f} ({pct_change:.2f}%)"
+                else:
+                    return "📈 Daily P&L: Not enough data for summary yet."
+            except Exception as e:
+                return f"⚠️ Error generating P&L summary: {e}"
+        send_telegram_message(summarize_daily_pnl())
 
         print(f"💾 Snapshot: USD=${usd:.2f}, Total=${total:.2f}")
     except Exception as e:
@@ -400,7 +420,8 @@ def run_bot():
 
             monitor_positions()
             log_portfolio_snapshot()
-            summarize_daily_pnl()
+            # After logging snapshot, send daily PnL update
+            # send_telegram_message(summarize_daily_pnl()) is now called inside log_portfolio_snapshot
             # Weekly PnL summary every Sunday at 5:00 PM (trigger if minute < 5)
             now_dt = datetime.now()
             if now_dt.weekday() == 6 and now_dt.hour == 17 and now_dt.minute < 5:
@@ -412,52 +433,7 @@ def run_bot():
             time.sleep(60)
 
 # === Daily PnL Summary ===
-def summarize_daily_pnl():
-    try:
-        df = pd.read_csv(TRADE_LOG_PATH)
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        df['Date'] = df['Timestamp'].dt.date
-
-        grouped = df.groupby(['Date', 'Symbol', 'Side'])[['Amount', 'Price']].agg(list).reset_index()
-        summary = {}
-
-        for _, row in grouped.iterrows():
-            key = (row['Date'], row['Symbol'])
-            if key not in summary:
-                summary[key] = {'buy': [], 'sell': []}
-            summary[key][row['Side']].append((row['Amount'], row['Price']))
-
-        messages = []
-        for (day, symbol), sides in summary.items():
-            if sides['buy'] and sides['sell']:
-                buy_total = sum(a * p for a, p in sides['buy'])
-                sell_total = sum(a * p for a, p in sides['sell'])
-                pnl = sell_total - buy_total
-                messages.append(f"{day} {symbol}: PnL ${pnl:.2f}")
-
-        if messages:
-            send_telegram_alert("📊 DAILY TRADE SUMMARY:\n" + "\n".join(messages))
-
-        # Log to Google Sheet tab: VX-C Daily PnL
-        try:
-            client = get_gspread_client()
-            if client:
-                sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
-                try:
-                    daily_tab = sheet.worksheet("VX-C Daily PnL")
-                except:
-                    daily_tab = sheet.add_worksheet(title="VX-C Daily PnL", rows="1000", cols="5")
-                    daily_tab.append_row(["Date", "Symbol", "PnL", "Asset Type"])
-                for (day, symbol), sides in summary.items():
-                    if sides['buy'] and sides['sell']:
-                        buy_total = sum(a * p for a, p in sides['buy'])
-                        sell_total = sum(a * p for a, p in sides['sell'])
-                        pnl = sell_total - buy_total
-                        daily_tab.append_row([str(day), symbol, round(pnl, 2), "crypto"])
-        except Exception as sheet_err:
-            send_telegram_alert(f"⚠️ Failed to log VX-C Daily PnL to sheet: {sheet_err}")
-    except Exception as e:
-        send_telegram_alert(f"⚠️ Failed to summarize PnL: {str(e)}")
+# (functionality replaced with the new summarize_daily_pnl in log_portfolio_snapshot)
 
 def summarize_weekly_pnl():
     try:
@@ -487,6 +463,33 @@ def summarize_weekly_pnl():
                     weekly_tab.append_row([row['Week'], round(row['Net PnL'], 2), "crypto"])
         except Exception as sheet_err:
             send_telegram_alert(f"⚠️ Failed to log VX-C Weekly PnL to sheet: {sheet_err}")
+
+        # Monthly PnL Summary
+        df['Month'] = df['Timestamp'].dt.to_period('M').astype(str)
+        monthly_summary = df.groupby('Month')['SignedAmount'].sum().reset_index()
+        monthly_summary.columns = ['Month', 'Net PnL']
+        lines_month = [f"{row['Month']}: ${row['Net PnL']:.2f}" for _, row in monthly_summary.iterrows()]
+        if lines_month:
+            send_telegram_alert("📅 MONTHLY PNL SUMMARY:\n" + "\n".join(lines_month))
+
+        # All-Time PnL Summary
+        total_pnl = df['SignedAmount'].sum()
+        send_telegram_alert(f"🧮 ALL-TIME PNL SUMMARY:\nNet PnL: ${total_pnl:.2f}")
+
+        # Log Monthly and All-Time to Google Sheet tab: VX-C Monthly PnL
+        try:
+            monthly_tab_name = "VX-C Monthly PnL"
+            if client:
+                try:
+                    monthly_tab = sheet.worksheet(monthly_tab_name)
+                except:
+                    monthly_tab = sheet.add_worksheet(title=monthly_tab_name, rows="1000", cols="3")
+                    monthly_tab.append_row(["Month", "Net PnL", "Asset Type"])
+                for _, row in monthly_summary.iterrows():
+                    monthly_tab.append_row([row['Month'], round(row['Net PnL'], 2), "crypto"])
+                monthly_tab.append_row(["All Time", round(total_pnl, 2), "crypto"])
+        except Exception as sheet_err:
+            send_telegram_alert(f"⚠️ Failed to log VX-C Monthly PnL to sheet: {sheet_err}")
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to summarize weekly PnL: {str(e)}")
 
