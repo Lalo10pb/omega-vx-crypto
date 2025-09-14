@@ -10,7 +10,7 @@ from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
-import datetime
+
 print("🟢 OMEGA-VX-CRYPTO bot started.")
 open_positions = set()
 open_positions_data = {}
@@ -161,7 +161,7 @@ def log_portfolio_snapshot():
             try:
                 df = pd.read_csv(equity_log_file)
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
-                today = datetime.datetime.now().date()
+                today = datetime.now().date()
                 daily_logs = df[df["timestamp"].dt.date == today]
                 if len(daily_logs) >= 2:
                     start_value = daily_logs.iloc[0]["portfolio_value"]
