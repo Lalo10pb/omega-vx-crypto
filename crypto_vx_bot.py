@@ -130,7 +130,11 @@ def log_portfolio_snapshot():
     try:
         balance = kraken.fetch_balance()
         usd = balance['USD']['free']
-        total = sum(asset['total'] for asset in balance['total'].values() if isinstance(asset, dict))
+        total = balance['total']
+        if isinstance(total, dict):
+            total = sum(v for v in total.values() if isinstance(v, (int, float)))
+        else:
+            total = 0
         timestamp = datetime.now().isoformat()
 
         # Log to local CSV
