@@ -1,8 +1,24 @@
+import base64
+import hashlib
+import hmac
+import uuid
+import json
 import ccxt
 import os
 import time
 from collections import defaultdict
 from dotenv import load_dotenv
+
+ # Load .env file from project root
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+print("📦 Attempting to load .env file...")
+load_dotenv(dotenv_path=env_path)
+
+print("🔑 Loaded API KEY:", os.getenv("KRAKEN_API_KEY", "[MISSING]"))
+print("📁 Looking for .env at:", env_path)
+if not os.getenv("KRAKEN_API_KEY"):
+    print("❌ ERROR: .env file not loaded correctly or KRAKEN_API_KEY is missing.")
+    exit(1)
 import numpy as np
 import requests
 import csv
@@ -52,30 +68,6 @@ def calculate_rsi(prices, period=14):
         rsi.append(100. - 100. / (1. + rs))
     return rsi
 
-# Load environment variables
-load_dotenv()
-
-# === Google Sheets Helper ===
-def get_gspread_client():
-    try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
-        client = gspread.authorize(creds)
-        return client
-    except Exception as e:
-        send_telegram_alert(f"❌ Google Sheets auth error: {str(e)}")
-        return None
-
-# Load Kraken API keys
-api_key = os.getenv("KRAKEN_API_KEY")
-api_secret = os.getenv("KRAKEN_API_SECRET")
-
-# Initialize Kraken client
-kraken = ccxt.kraken({
-    'apiKey': api_key,
-    'secret': api_secret,
-    'enableRateLimit': True
-})
 
 def send_telegram_alert(message):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -94,6 +86,62 @@ def send_telegram_alert(message):
             print(f"⚠️ Telegram alert failed: {response.text}")
     except Exception as e:
         print(f"❌ Telegram exception: {str(e)}")
+
+# === Exchange Client Loader ===
+exchange_name = os.getenv("EXCHANGE", "okx").lower()
+if exchange_name == "bybit":
+    exchange = ccxt.bybit({
+        'apiKey': os.getenv("BYBIT_API_KEY"),
+        'secret': os.getenv("BYBIT_API_SECRET"),
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',
+        }
+    })
+    if os.getenv("BYBIT_API_TESTNET", "false").lower() == "true":
+        exchange.set_sandbox_mode(True)
+    print("🪙 BYBIT TESTNET mode active.")
+    send_telegram_alert("🪙 BYBIT TESTNET mode active.")
+elif exchange_name == "kraken":
+    exchange = ccxt.kraken({
+        'apiKey': os.getenv("KRAKEN_API_KEY"),
+        'secret': os.getenv("KRAKEN_API_SECRET"),
+        'enableRateLimit': True,
+    })
+    print("🪙 KRAKEN LIVE mode active.")
+    send_telegram_alert("🪙 KRAKEN LIVE mode active.")
+else:
+    exchange = ccxt.okx({
+        'apiKey': os.getenv("OKX_API_KEY"),
+        'secret': os.getenv("OKX_API_SECRET"),
+        'password': os.getenv("OKX_API_PASSPHRASE"),
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot'
+        }
+    })
+    # Set sandbox mode according to OKX_API_TESTNET env variable
+    if os.getenv("OKX_API_TESTNET", "false").lower() == "true":
+        exchange.set_sandbox_mode(True)
+        print("🪙 OKX TESTNET mode active.")
+        send_telegram_alert("🪙 OKX TESTNET mode active.")
+    else:
+        exchange.set_sandbox_mode(False)
+        print("🪙 OKX LIVE MODE active.")
+        send_telegram_alert("🪙 OKX LIVE MODE active.")
+
+
+
+# === Google Sheets Helper ===
+def get_gspread_client():
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        send_telegram_alert(f"❌ Google Sheets auth error: {str(e)}")
+        return None
 
 def log_trade(symbol, side, amount, price, reason):
     timestamp = datetime.now().isoformat()
@@ -129,13 +177,15 @@ def log_trade(symbol, side, amount, price, reason):
 
 def log_portfolio_snapshot():
     try:
-        balance = kraken.fetch_balance()
-        usd = balance['USD']['free']
-        total = balance['total']
-        if isinstance(total, dict):
-            total = sum(v for v in total.values() if isinstance(v, (int, float)))
-        else:
-            total = 0
+        usd = 0
+        total = 0
+        try:
+            balance = exchange.fetch_balance()
+            print("💰 Kraken Balance Keys:", list(balance['total'].keys()))
+            usd = balance['total'].get('USD', 0)
+            total = sum(v for v in balance['total'].values() if isinstance(v, (int, float)))
+        except Exception as e:
+            print("❌ Error fetching balance:", e)
         timestamp = datetime.now().isoformat()
 
         # Log to local CSV
@@ -173,22 +223,14 @@ def log_portfolio_snapshot():
                     return "📈 Daily P&L: Not enough data for summary yet."
             except Exception as e:
                 return f"⚠️ Error generating P&L summary: {e}"
-        send_telegram_message(summarize_daily_pnl())
+        send_telegram_alert(summarize_daily_pnl())
 
         print(f"💾 Snapshot: USD=${usd:.2f}, Total=${total:.2f}")
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
 def execute_trade(symbol, side, amount, price=None):
-    # Prevent duplicate buys or trades within cooldown window
     now = time.time()
-    # Apply global cooldown for both buy/sell
-    if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
-        wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
-        reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
-        print(reason)
-        send_telegram_alert(reason)
-        return
     if side == "buy":
         if symbol in open_positions:
             reason = f"⛔ Trade rejected: {symbol} is already in open_positions."
@@ -201,17 +243,42 @@ def execute_trade(symbol, side, amount, price=None):
             print(reason)
             send_telegram_alert(reason)
             return
+    if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
+        wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
+        reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
+        print(reason)
+        send_telegram_alert(reason)
+        return
+
     try:
-        order = kraken.create_market_order(symbol, side, float(amount))
-        send_telegram_alert(f"✅ {side.upper()} order executed for {symbol} | Amount: {amount}")
+        print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
+        if side == "buy":
+            price = exchange.fetch_ticker(symbol)['last']
+            order = exchange.create_market_buy_order(symbol, amount)
+        elif side == "sell":
+            order = exchange.create_market_sell_order(symbol, amount)
+        else:
+            send_telegram_alert(f"❌ Invalid trade side: {side}")
+            return
+
+        last_buy_time[symbol] = now if side == "buy" else last_buy_time[symbol]
         last_trade_time[symbol] = now
-        log_trade(symbol, side, amount, order['price'] if 'price' in order else 'MKT', "manual trade")
         if side == "buy":
             open_positions.add(symbol)
-            last_buy_time[symbol] = time.time()
-        return order
+            open_positions_data[symbol] = {
+                "entry_price": order['average'] or order.get('price'),
+                "amount": amount
+            }
+        elif side == "sell":
+            open_positions.discard(symbol)
+            open_positions_data.pop(symbol, None)
+
+        price = order['average'] or order.get('price')
+        log_trade(symbol, side, amount, price, "Live trade executed")
+        print(f"✅ {side.upper()} order executed for {symbol} at ${price:.2f}")
     except Exception as e:
-        send_telegram_alert(f"❌ Failed to execute {side} order for {symbol}: {str(e)}")
+        send_telegram_alert(f"❌ Trade execution failed: {e}")
+        print(f"❌ Trade execution failed: {e}")
 
 # === SELL LOGIC CONFIG ===
 trailing_stop_pct = 4.5  # widened to reduce false exits from micro swings
@@ -220,148 +287,85 @@ hard_stop_pct = 4.0      # allows slightly more downside to avoid noise
 
 # === Monitor & Auto-Close Open Positions ===
 def monitor_positions():
-    print("🔍 Monitoring live positions...")
-    try:
-        balance = kraken.fetch_balance()
-        tickers = kraken.fetch_tickers()
-
-        for symbol, market_data in tickers.items():
-            if "/USD" not in symbol:
+    print("🔍 Monitoring open positions...")
+    for symbol in list(open_positions):
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            entry = open_positions_data.get(symbol, {})
+            if not entry:
                 continue
-
-            market = kraken.market(symbol)
-            base = market['base']
-            quote = market['quote']
-
-            if quote != 'USD' or base not in balance or balance[base]['total'] == 0:
-                continue
-
-            amount_held = balance[base]['total']
-            current_price = market_data['last']
-
-            # Fetch latest buy trade as pseudo-entry price
-            entry_price = None
-            try:
-                trades = kraken.fetch_my_trades(symbol)
-                buys = [t for t in trades if t['side'] == 'buy']
-                if buys:
-                    entry_price = buys[-1]['price']
-            except Exception as e:
-                send_telegram_alert(f"⚠️ Trade history error for {symbol}: {e}")
-                continue
-
-            if not entry_price:
-                continue
-
+            entry_price = entry['entry_price']
+            amount = entry['amount']
             change_pct = ((current_price - entry_price) / entry_price) * 100
-            print(f"📊 {symbol}: entry=${entry_price:.2f}, now=${current_price:.2f}, Δ={change_pct:.2f}%")
 
-            # TAKE PROFIT
             if change_pct >= take_profit_pct:
-                kraken.create_market_order(symbol, "sell", amount_held)
-                log_trade(symbol, "sell", amount_held, current_price, "take profit")
-                send_telegram_alert(f"🎯 TAKE PROFIT: Sold {symbol} at ${current_price:.2f} (+{change_pct:.2f}%)")
-                open_positions.discard(symbol)
-                open_positions_data.pop(symbol, None)
-                continue
-
-            # HARD STOP
-            if change_pct <= -hard_stop_pct:
-                kraken.create_market_order(symbol, "sell", amount_held)
-                log_trade(symbol, "sell", amount_held, current_price, "hard stop")
-                send_telegram_alert(f"🛑 HARD STOP: Sold {symbol} at ${current_price:.2f} ({change_pct:.2f}%)")
-                open_positions.discard(symbol)
-                open_positions_data.pop(symbol, None)
-                continue
-
-            # TRAILING STOP
-            if symbol not in open_positions_data:
-                open_positions_data[symbol] = {
-                    'entry': entry_price,
-                    'peak': current_price
-                }
+                send_telegram_alert(f"🎯 TAKE PROFIT HIT for {symbol} (+{change_pct:.2f}%)")
+                execute_trade(symbol, "sell", amount, current_price)
+            elif change_pct <= -hard_stop_pct:
+                send_telegram_alert(f"🛑 HARD STOP triggered for {symbol} ({change_pct:.2f}%)")
+                execute_trade(symbol, "sell", amount, current_price)
+            elif change_pct <= -trailing_stop_pct:
+                send_telegram_alert(f"📉 TRAILING STOP triggered for {symbol} ({change_pct:.2f}%)")
+                execute_trade(symbol, "sell", amount, current_price)
             else:
-                if current_price > open_positions_data[symbol]['peak']:
-                    open_positions_data[symbol]['peak'] = current_price
-
-                peak = open_positions_data[symbol]['peak']
-                drop_pct = ((peak - current_price) / peak) * 100
-
-                if drop_pct >= trailing_stop_pct:
-                    kraken.create_market_order(symbol, "sell", amount_held)
-                    log_trade(symbol, "sell", amount_held, current_price, "trailing stop")
-                    send_telegram_alert(f"🔻 TRAILING STOP: Sold {symbol} at ${current_price:.2f} (-{drop_pct:.2f}% from peak)")
-                    open_positions.discard(symbol)
-                    open_positions_data.pop(symbol, None)
-
-    except Exception as e:
-        send_telegram_alert(f"❌ monitor_positions() error: {e}")
+                print(f"⏳ {symbol} holding: {change_pct:.2f}%")
+        except Exception as e:
+            send_telegram_alert(f"⚠️ monitor_positions error for {symbol}: {str(e)}")
 
 # === Improved Coin Scanner ===
 def scan_top_cryptos(limit=5):
-    print("🔎 Scanning top crypto pairs by volume and filters...")
     try:
-        markets = kraken.load_markets()
-        ranked = []
+        print(f"🔍 Scanning {exchange_name.upper()} markets (BEST STRATEGY)...")
+        markets = exchange.load_markets()
+        scores = []
 
-        for symbol, data in markets.items():
-            if not data.get('active', False) or "/USD" not in symbol or not data.get('spot', False):
+        # Handle quote currency for Kraken vs others
+        if isinstance(exchange, ccxt.kraken):
+            quote_currency = "/USD"
+        else:
+            quote_currency = "/USDT"
+
+        for symbol in markets:
+            if not symbol.endswith(quote_currency):
                 continue
-
             try:
-                ohlcv = kraken.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                closes = [candle[4] for candle in ohlcv]
-
-                # Filter: Require at least 1% spread in last 12 closes
-                min_price = min(closes[-12:])
-                max_price = max(closes[-12:])
-                spread_pct = ((max_price - min_price) / min_price) * 100
-                if spread_pct < 1.0:
-                    print(f"⛔ {symbol} rejected: spread too low ({spread_pct:.2f}%)")
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+                if len(ohlcv) < 50:
                     continue
 
-                # Filter: Require 1h USD quote volume >= 50k
-                try:
-                    ticker = kraken.fetch_ticker(symbol)
-                    volume_usd = ticker['quoteVolume']
-                    if volume_usd is None or volume_usd < 50000:
-                        print(f"⛔ {symbol} rejected: low volume (${volume_usd:.0f})")
-                        continue
-                except Exception as vol_err:
-                    print(f"⚠️ Volume fetch error for {symbol}: {vol_err}")
-                    continue
+                closes = [c[4] for c in ohlcv]
+                volumes = [c[5] for c in ohlcv]
 
-                # Scoring logic
-                ema_values = calculate_ema(closes, period=20)
-                ema_slope = ema_values[-1] - ema_values[-5] if len(ema_values) > 5 else 0
-                rsi_values = calculate_rsi(closes, period=14)
-                latest_rsi = rsi_values[-1] if rsi_values else 0
-                volatility = np.std(closes[-10:]) / np.mean(closes[-10:]) if len(closes) > 10 else 0
+                ema9 = calculate_ema(closes, period=9)[-1]
+                ema21 = calculate_ema(closes, period=21)[-1]
+                ema50 = calculate_ema(closes, period=50)[-1]
+                last_price = closes[-1]
+                rsi = calculate_rsi(closes)[-1]
+                avg_vol = np.mean(volumes[-20:])
+                curr_vol = volumes[-1]
 
                 score = 0
-                if ema_slope > 0:
+                if ema9 > ema21 > ema50:
+                    score += 2
+                if 40 < rsi < 70:
                     score += 1
-                if 55 <= latest_rsi <= 75:
+                if curr_vol > 2 * avg_vol:
                     score += 1
-                if 0.01 <= volatility <= 0.05:
+                if abs(closes[-1] - closes[-5]) / closes[-5] > 0.01:
                     score += 1
 
-                ranked.append({
-                    "symbol": symbol,
-                    "score": score
-                })
-                print(f"🔬 {symbol} — Score: {score} | EMA Slope: {ema_slope:.4f} | RSI: {latest_rsi:.2f} | Volatility: {volatility:.4f}")
-            except Exception as inner_e:
-                print(f"⚠️ Error scoring {symbol}: {inner_e}")
+                if score >= 3:
+                    scores.append((symbol, score, rsi, last_price))
+            except Exception:
                 continue
 
-        ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)
-        top_symbols = [item["symbol"] for item in ranked[:limit]]
-        print(f"✅ AI-ranked top {limit} symbols: {top_symbols}")
-        return top_symbols
-
+        scores.sort(key=lambda x: (-x[1], -x[2]))
+        top = [s[0] for s in scores[:limit]]
+        print("✅ BEST STRATEGY PICKS:", top)
+        return top
     except Exception as e:
-        send_telegram_alert(f"❌ Scanner error: {str(e)}")
+        send_telegram_alert(f"❌ Best-strategy scan error: {e}")
         return []
 
 # === Main Bot Loop ===
@@ -370,64 +374,35 @@ def run_bot():
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
-            # Dynamically determine trade size based on available USD balance
+            # Live trading mode with fixed $10 per trade
             try:
-                balance = kraken.fetch_balance()
-                usd_available = balance['USD']['free']
-                trade_amount_usd = round(usd_available * 0.05, 2)
-                print(f"💰 Dynamic trade amount: ${trade_amount_usd}")
+                trade_amount_usd = 10.00  # Live trading with $10 per trade
+                print(f"💰 Live trading mode active. Fixed trade amount: ${trade_amount_usd}")
             except Exception as e:
-                send_telegram_alert(f"⚠️ Failed to fetch USD balance: {e}")
-                trade_amount_usd = 25  # fallback default
+                send_telegram_alert(f"⚠️ Failed to set live trade amount: {e}")
+                trade_amount_usd = 10.00
 
             pairs = scan_top_cryptos()
             send_telegram_alert(f"🧠 Scanned top cryptos: {pairs}")
             for symbol in pairs:
                 print(f"📈 Evaluating {symbol}...")
-
                 try:
-                    ohlcv = kraken.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
                     closes = [candle[4] for candle in ohlcv]
-
-                    ema_values = calculate_ema(closes, period=20)
-                    if closes[-1] < ema_values[-1]:
-                        print(f"⛔ {symbol} rejected: price below EMA.")
-                        send_telegram_alert(f"⛔ {symbol} rejected: price below EMA.")
-                        continue
-
-                    rsi_values = calculate_rsi(closes, period=14)
-                    if rsi_values[-1] < 50:
-                        print(f"⛔ {symbol} rejected: RSI below 50.")
-                        send_telegram_alert(f"⛔ {symbol} rejected: RSI below 50.")
-                        continue
-
-                    print(f"✅ {symbol} passed filters. Ready for trade logic.")
-
-                    try:
-                        market = kraken.market(symbol)
-                        price = closes[-1]
-                        precision = int(market['precision'].get('amount', 6) or 6)
-                        amount = round(trade_amount_usd / price, precision)
-
-                        print(f"🛒 Executing LIVE BUY for {symbol} at ${price:.2f}, amount={amount}")
-                        execute_trade(symbol, "buy", amount)
-
-                    except Exception as trade_error:
-                        send_telegram_alert(f"❌ Trade failed for {symbol}: {str(trade_error)}")
-
+                    price = closes[-1]
+                    amount = round(trade_amount_usd / price, 6)
+                    print(f"✅ {symbol} passed filters. Forcing test trade.")
+                    execute_trade(symbol, "buy", amount)
                 except Exception as e:
                     send_telegram_alert(f"⚠️ Error evaluating {symbol}: {str(e)}")
 
             monitor_positions()
             log_portfolio_snapshot()
-            # After logging snapshot, send daily PnL update
-            # send_telegram_message(summarize_daily_pnl()) is now called inside log_portfolio_snapshot
-            # Weekly PnL summary every Sunday at 5:00 PM (trigger if minute < 5)
             now_dt = datetime.now()
             if now_dt.weekday() == 6 and now_dt.hour == 17 and now_dt.minute < 5:
                 summarize_weekly_pnl()
             print("📌 Current open positions:", open_positions)
-            time.sleep(15)  # Reduced sleep for faster log testing
+            time.sleep(30)
         except Exception as e:
             send_telegram_alert(f"🚨 Bot error: {str(e)}")
             time.sleep(60)
