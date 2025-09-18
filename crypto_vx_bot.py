@@ -326,8 +326,13 @@ def scan_top_cryptos(limit=5):
         else:
             quote_currency = "/USDT"
 
+        # Nebraska restricted tokens (or similar) filter keywords
+        restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
+
         for symbol in markets:
             if not symbol.endswith(quote_currency):
+                continue
+            if any(keyword in symbol for keyword in restricted_keywords):
                 continue
             try:
                 ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
