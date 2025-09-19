@@ -1,24 +1,15 @@
-import base64
-import hashlib
-import hmac
-import uuid
-import json
 import ccxt
 import os
 import time
 from collections import defaultdict
 from dotenv import load_dotenv
 
- # Load .env file from project root
 env_path = os.path.join(os.path.dirname(__file__), ".env")
-print("📦 Attempting to load .env file...")
-load_dotenv(dotenv_path=env_path)
-
-print("🔑 Loaded API KEY:", os.getenv("KRAKEN_API_KEY", "[MISSING]"))
-print("📁 Looking for .env at:", env_path)
-if not os.getenv("KRAKEN_API_KEY"):
-    print("❌ ERROR: .env file not loaded correctly or KRAKEN_API_KEY is missing.")
-    exit(1)
+print(f"📦 Loading environment from: {env_path}")
+if load_dotenv(dotenv_path=env_path):
+    print("🔑 Environment variables loaded from .env.")
+else:
+    print("⚠️ .env file not found or could not be loaded; relying on existing environment.")
 import numpy as np
 import requests
 import csv
@@ -56,16 +47,27 @@ def calculate_rsi(prices, period=14):
     seed = deltas[:period]
     up = seed[seed >= 0].sum() / period
     down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi = [100. - 100. / (1. + rs)]
+    if down == 0:
+        first_rsi = 100.0 if up > 0 else 50.0
+    elif up == 0:
+        first_rsi = 0.0
+    else:
+        rs = up / down
+        first_rsi = 100. - 100. / (1. + rs)
+    rsi = [first_rsi]
 
     for delta in deltas[period:]:
         up_val = max(delta, 0)
         down_val = -min(delta, 0)
         up = (up * (period - 1) + up_val) / period
         down = (down * (period - 1) + down_val) / period
-        rs = up / down if down != 0 else 0
-        rsi.append(100. - 100. / (1. + rs))
+        if down == 0:
+            rsi.append(100.0 if up > 0 else 50.0)
+        elif up == 0:
+            rsi.append(0.0)
+        else:
+            rs = up / down
+            rsi.append(100. - 100. / (1. + rs))
     return rsi
 
 
@@ -89,6 +91,25 @@ def send_telegram_alert(message):
 
 # === Exchange Client Loader ===
 exchange_name = os.getenv("EXCHANGE", "okx").lower()
+
+
+def validate_exchange_credentials(name: str) -> None:
+    required_vars = []
+    if name == "bybit":
+        required_vars = ["BYBIT_API_KEY", "BYBIT_API_SECRET"]
+    elif name == "kraken":
+        required_vars = ["KRAKEN_API_KEY", "KRAKEN_API_SECRET"]
+    else:
+        required_vars = ["OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE"]
+
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        print(f"❌ Missing required credentials for {name.upper()}: {', '.join(missing)}")
+        exit(1)
+
+
+validate_exchange_credentials(exchange_name)
+
 if exchange_name == "bybit":
     exchange = ccxt.bybit({
         'apiKey': os.getenv("BYBIT_API_KEY"),
@@ -164,10 +185,10 @@ def log_trade(symbol, side, amount, price, reason):
 
     # Log to Google Sheet
     try:
+        trade_tab = os.getenv("TRADE_SHEET_NAME", "Crypto Trade Log")
         client = get_gspread_client()
         if client:
             sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
-            trade_tab = os.getenv("TRADE_SHEET_NAME", "Crypto Trade Log")
             worksheet = sheet.worksheet(trade_tab)
             worksheet.append_row(row)
     except Exception as e:
@@ -243,7 +264,7 @@ def execute_trade(symbol, side, amount, price=None):
             print(reason)
             send_telegram_alert(reason)
             return
-    if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
+    if side == "buy" and now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
         wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
         reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
         print(reason)
@@ -252,10 +273,17 @@ def execute_trade(symbol, side, amount, price=None):
 
     try:
         print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
+        fallback_price = price
         if side == "buy":
-            price = exchange.fetch_ticker(symbol)['last']
+            ticker = exchange.fetch_ticker(symbol)
+            fallback_price = ticker.get('last')
             order = exchange.create_market_buy_order(symbol, amount)
         elif side == "sell":
+            if fallback_price is None:
+                try:
+                    fallback_price = exchange.fetch_ticker(symbol).get('last')
+                except Exception:
+                    fallback_price = None
             order = exchange.create_market_sell_order(symbol, amount)
         else:
             send_telegram_alert(f"❌ Invalid trade side: {side}")
@@ -273,9 +301,14 @@ def execute_trade(symbol, side, amount, price=None):
             open_positions.discard(symbol)
             open_positions_data.pop(symbol, None)
 
-        price = order['average'] or order.get('price')
-        log_trade(symbol, side, amount, price, "Live trade executed")
-        print(f"✅ {side.upper()} order executed for {symbol} at ${price:.2f}")
+        executed_price = order.get('average') or order.get('price') or fallback_price
+        if executed_price is None:
+            print(f"⚠️ {symbol} execution price unavailable; logging as 0.0")
+            executed_price = 0.0
+
+        executed_price = float(executed_price)
+        log_trade(symbol, side, amount, executed_price, "Live trade executed")
+        print(f"✅ {side.upper()} order executed for {symbol} at ${executed_price:.2f}")
     except Exception as e:
         send_telegram_alert(f"❌ Trade execution failed: {e}")
         print(f"❌ Trade execution failed: {e}")
@@ -430,19 +463,25 @@ def summarize_weekly_pnl():
             send_telegram_alert("📆 WEEKLY PNL SUMMARY:\n" + "\n".join(lines))
 
         # Log to Google Sheet tab: VX-C Weekly PnL
-        try:
-            client = get_gspread_client()
-            if client:
+        client = get_gspread_client()
+        sheet = None
+        if client:
+            try:
                 sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
+            except Exception as sheet_err:
+                send_telegram_alert(f"⚠️ Failed to access Google Sheet: {sheet_err}")
+
+        if sheet:
+            try:
                 try:
                     weekly_tab = sheet.worksheet("VX-C Weekly PnL")
-                except:
+                except Exception:
                     weekly_tab = sheet.add_worksheet(title="VX-C Weekly PnL", rows="1000", cols="3")
                     weekly_tab.append_row(["Week", "Net PnL", "Asset Type"])
                 for _, row in summary.iterrows():
                     weekly_tab.append_row([row['Week'], round(row['Net PnL'], 2), "crypto"])
-        except Exception as sheet_err:
-            send_telegram_alert(f"⚠️ Failed to log VX-C Weekly PnL to sheet: {sheet_err}")
+            except Exception as sheet_err:
+                send_telegram_alert(f"⚠️ Failed to log VX-C Weekly PnL to sheet: {sheet_err}")
 
         # Monthly PnL Summary
         df['Month'] = df['Timestamp'].dt.to_period('M').astype(str)
@@ -459,10 +498,10 @@ def summarize_weekly_pnl():
         # Log Monthly and All-Time to Google Sheet tab: VX-C Monthly PnL
         try:
             monthly_tab_name = "VX-C Monthly PnL"
-            if client:
+            if sheet:
                 try:
                     monthly_tab = sheet.worksheet(monthly_tab_name)
-                except:
+                except Exception:
                     monthly_tab = sheet.add_worksheet(title=monthly_tab_name, rows="1000", cols="3")
                     monthly_tab.append_row(["Month", "Net PnL", "Asset Type"])
                 for _, row in monthly_summary.iterrows():
