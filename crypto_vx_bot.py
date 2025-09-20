@@ -1,7 +1,9 @@
 import ccxt
+import json
 import os
 import time
 from collections import defaultdict
+from typing import Optional
 from dotenv import load_dotenv
 
 env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -25,6 +27,11 @@ last_buy_time = defaultdict(lambda: 0)
 last_trade_time = defaultdict(lambda: 0)
 COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
+
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 5))
+MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
+STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
+LIMIT_PRICE_BUFFER = float(os.getenv("LIMIT_PRICE_BUFFER", 0.001))
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -152,8 +159,106 @@ else:
         send_telegram_alert("🪙 OKX LIVE MODE active.")
 
 
+# === Order Utility Helpers ===
+
+def extract_valid_price(ticker: dict) -> Optional[float]:
+    """Return the first positive price from common ticker fields."""
+    if not isinstance(ticker, dict):
+        return None
+    candidates = [
+        ticker.get('last'),
+        ticker.get('close'),
+        ticker.get('ask'),
+        ticker.get('bid'),
+        ticker.get('average'),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            return float(candidate)
+    return None
+
+
+def wait_for_order_fill(symbol: str, order: dict, timeout: int = 45, poll_interval: int = 3) -> dict:
+    """Poll the exchange until the order is filled, cancelled, or times out."""
+    order_id = order.get('id')
+    if not order_id:
+        return order
+
+    deadline = time.time() + timeout
+    latest = order
+    while time.time() < deadline:
+        try:
+            latest = exchange.fetch_order(order_id, symbol)
+        except Exception as fetch_err:
+            print(f"⚠️ Failed to fetch order {order_id}: {fetch_err}")
+            time.sleep(poll_interval)
+            continue
+
+        status = latest.get('status')
+        filled = latest.get('filled') or 0
+        amount = latest.get('amount') or 0
+        if status == 'closed' or (filled and filled >= amount):
+            return latest
+        if status in {'canceled', 'rejected', 'expired'}:
+            return latest
+        time.sleep(poll_interval)
+
+    print(f"⏰ Order {order_id} timeout reached; attempting to cancel.")
+    try:
+        exchange.cancel_order(order_id, symbol)
+    except Exception as cancel_err:
+        print(f"⚠️ Failed to cancel order {order_id}: {cancel_err}")
+    return latest
+
 
 # === Google Sheets Helper ===
+def load_bot_state() -> None:
+    global open_positions, open_positions_data, last_buy_time, last_trade_time
+    if not STATE_PATH or not os.path.exists(STATE_PATH):
+        return
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as state_file:
+            data = json.load(state_file)
+        open_positions = set(data.get("open_positions", []))
+        open_positions_data = data.get("open_positions_data", {}) or {}
+        last_buy = {k: float(v) for k, v in (data.get("last_buy_time") or {}).items()}
+        last_trade = {k: float(v) for k, v in (data.get("last_trade_time") or {}).items()}
+        last_buy_time = defaultdict(lambda: 0, last_buy)
+        last_trade_time = defaultdict(lambda: 0, last_trade)
+        print(f"🗂️ Restored bot state from {STATE_PATH}.")
+    except Exception as err:
+        print(f"⚠️ Failed to load bot state: {err}")
+
+
+def save_bot_state() -> None:
+    if not STATE_PATH:
+        return
+    try:
+        payload = {
+            "open_positions": sorted(open_positions),
+            "open_positions_data": open_positions_data,
+            "last_buy_time": {k: float(v) for k, v in last_buy_time.items()},
+            "last_trade_time": {k: float(v) for k, v in last_trade_time.items()},
+        }
+        with open(STATE_PATH, "w", encoding="utf-8") as state_file:
+            json.dump(payload, state_file, ensure_ascii=True, indent=2)
+    except Exception as err:
+        print(f"⚠️ Failed to persist bot state: {err}")
+
+
+def current_total_exposure() -> float:
+    exposure = 0.0
+    for info in open_positions_data.values():
+        price = info.get('entry_price')
+        amount = info.get('amount')
+        if isinstance(price, (int, float)) and isinstance(amount, (int, float)):
+            exposure += max(price, 0) * max(amount, 0)
+    return float(exposure)
+
+
+load_bot_state()
+
+
 def get_gspread_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -264,6 +369,11 @@ def execute_trade(symbol, side, amount, price=None):
             print(reason)
             send_telegram_alert(reason)
             return
+        if len(open_positions) >= MAX_OPEN_POSITIONS:
+            reason = f"🚫 Max open positions reached ({MAX_OPEN_POSITIONS}); skipping {symbol} buy."
+            print(reason)
+            send_telegram_alert(reason)
+            return
     if side == "buy" and now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
         wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
         reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
@@ -273,42 +383,150 @@ def execute_trade(symbol, side, amount, price=None):
 
     try:
         print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
-        fallback_price = price
+        if amount is None or amount <= 0:
+            message = f"⚠️ Invalid trade amount for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+        ticker = exchange.fetch_ticker(symbol)
+        reference_price = extract_valid_price(ticker)
+        if reference_price is None:
+            message = f"⚠️ No valid price data available for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        try:
+            order_book = exchange.fetch_order_book(symbol, limit=10)
+        except Exception as book_err:
+            message = f"⚠️ Failed to fetch order book for {symbol}: {book_err}"
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        side_levels = order_book.get('asks' if side == "buy" else 'bids') or []
+        side_levels = [level for level in side_levels if isinstance(level, list) and len(level) >= 2]
+        if not side_levels:
+            message = f"⚠️ Order book empty for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        book_price = side_levels[0][0]
+        if not isinstance(book_price, (int, float)) or book_price <= 0:
+            message = f"⚠️ Order book price invalid for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        available_volume = sum(level[1] for level in side_levels if isinstance(level[1], (int, float)))
+        if side == "buy" and available_volume < amount:
+            message = f"⚠️ Not enough liquidity to buy {amount} {symbol}; available {available_volume:.4f}."
+            print(message)
+            send_telegram_alert(message)
+            return
+        if side == "sell":
+            position = open_positions_data.get(symbol, {})
+            position_amount = position.get('amount', 0)
+            amount = min(amount, position_amount) if position_amount else amount
+            if amount <= 0:
+                message = f"⚠️ No position size available for {symbol}; skipping sell."
+                print(message)
+                send_telegram_alert(message)
+                return
+            if available_volume < amount:
+                message = f"⚠️ Not enough liquidity to sell {amount} {symbol}; available {available_volume:.4f}."
+                print(message)
+                send_telegram_alert(message)
+                return
+
+        fallback_price = price if isinstance(price, (int, float)) and price > 0 else reference_price
+        if LIMIT_PRICE_BUFFER < 0:
+            buffer = 0.0
+        else:
+            buffer = LIMIT_PRICE_BUFFER
         if side == "buy":
-            ticker = exchange.fetch_ticker(symbol)
-            fallback_price = ticker.get('last')
-            order = exchange.create_market_buy_order(symbol, amount)
+            limit_price = book_price * (1 + buffer)
+        else:
+            limit_price = book_price * (1 - buffer)
+
+        limit_price = round(limit_price, 8)
+        if limit_price <= 0:
+            message = f"⚠️ Computed limit price invalid for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        if side == "buy":
+            projected_exposure = current_total_exposure() + (fallback_price * amount)
+            if projected_exposure > MAX_TOTAL_EXPOSURE_USD:
+                message = (
+                    f"🚫 Exposure cap hit: projected ${projected_exposure:.2f} exceeds ${MAX_TOTAL_EXPOSURE_USD:.2f}; "
+                    f"skipping {symbol} buy."
+                )
+                print(message)
+                send_telegram_alert(message)
+                return
+
+        if side == "buy":
+            order = exchange.create_limit_buy_order(symbol, amount, limit_price)
         elif side == "sell":
-            if fallback_price is None:
-                try:
-                    fallback_price = exchange.fetch_ticker(symbol).get('last')
-                except Exception:
-                    fallback_price = None
-            order = exchange.create_market_sell_order(symbol, amount)
+            order = exchange.create_limit_sell_order(symbol, amount, limit_price)
         else:
             send_telegram_alert(f"❌ Invalid trade side: {side}")
             return
 
-        last_buy_time[symbol] = now if side == "buy" else last_buy_time[symbol]
-        last_trade_time[symbol] = now
-        if side == "buy":
-            open_positions.add(symbol)
-            open_positions_data[symbol] = {
-                "entry_price": order['average'] or order.get('price'),
-                "amount": amount
-            }
-        elif side == "sell":
-            open_positions.discard(symbol)
-            open_positions_data.pop(symbol, None)
+        print(f"📍LIMIT {side.upper()} for {symbol} @ ${limit_price} (amount: {amount}) placed; waiting for fill...")
+        final_order = wait_for_order_fill(symbol, order)
+        status = final_order.get('status')
+        filled_amount = float(final_order.get('filled') or 0.0)
 
-        executed_price = order.get('average') or order.get('price') or fallback_price
-        if executed_price is None:
-            print(f"⚠️ {symbol} execution price unavailable; logging as 0.0")
-            executed_price = 0.0
+        if filled_amount <= 0:
+            message = f"⏹️ {symbol} {side} order not filled (status: {status})."
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        executed_price = final_order.get('average') or final_order.get('price') or fallback_price
+        if executed_price is None or executed_price <= 0:
+            executed_price = fallback_price
+
+        if executed_price is None or executed_price <= 0:
+            message = f"⚠️ {symbol} execution price unavailable; skipping trade log."
+            print(message)
+            send_telegram_alert(message)
+            return
 
         executed_price = float(executed_price)
-        log_trade(symbol, side, amount, executed_price, "Live trade executed")
-        print(f"✅ {side.upper()} order executed for {symbol} at ${executed_price:.2f}")
+        if filled_amount < amount:
+            send_telegram_alert(
+                f"ℹ️ Partial fill for {symbol} {side}: filled {filled_amount} of {amount}. Remaining order cancelled."
+            )
+
+        last_trade_time[symbol] = now
+        if side == "buy":
+            last_buy_time[symbol] = now
+            open_positions.add(symbol)
+            open_positions_data[symbol] = {
+                "entry_price": executed_price,
+                "amount": filled_amount
+            }
+        else:
+            position = open_positions_data.get(symbol, {})
+            if position:
+                remaining = max(position.get('amount', 0) - filled_amount, 0)
+                if remaining > 1e-8:
+                    position['amount'] = remaining
+                else:
+                    open_positions.discard(symbol)
+                    open_positions_data.pop(symbol, None)
+            else:
+                open_positions.discard(symbol)
+                open_positions_data.pop(symbol, None)
+
+        log_trade(symbol, side, filled_amount, executed_price, "Live trade executed")
+        print(f"✅ {side.upper()} order filled for {symbol}: {filled_amount} @ ${executed_price:.4f} (status: {status})")
+        save_bot_state()
     except Exception as e:
         send_telegram_alert(f"❌ Trade execution failed: {e}")
         print(f"❌ Trade execution failed: {e}")
@@ -323,23 +541,70 @@ def monitor_positions():
     print("🔍 Monitoring open positions...")
     for symbol in list(open_positions):
         try:
-            ticker = exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+            if not ohlcv or len(ohlcv) < 2:
+                print(f"⚠️ Insufficient OHLCV data for {symbol}; skipping monitoring cycle.")
+                continue
+            closes = [candle[4] for candle in ohlcv]
+            highs = [candle[2] for candle in ohlcv]
+            lows = [candle[3] for candle in ohlcv]
+
+            # === ATR calculation ===
+            tr_list = []
+            for i in range(1, len(closes)):
+                high = highs[i]
+                low = lows[i]
+                prev_close = closes[i - 1]
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                tr_list.append(tr)
+            if len(tr_list) < 14:
+                print(f"⚠️ Not enough data to compute ATR for {symbol}; skipping.")
+                continue
+            atr_window = [tr for tr in tr_list[-14:] if isinstance(tr, (int, float))]
+            if not atr_window:
+                print(f"⚠️ ATR window invalid for {symbol}; skipping.")
+                continue
+            atr = float(np.mean(atr_window))
+            if not np.isfinite(atr) or atr <= 0:
+                print(f"⚠️ ATR computed as non-positive for {symbol}; skipping.")
+                continue
+
+            current_price = closes[-1]
+            if not isinstance(current_price, (int, float)) or current_price <= 0:
+                print(f"⚠️ Current price invalid for {symbol}; skipping.")
+                continue
             entry = open_positions_data.get(symbol, {})
             if not entry:
                 continue
-            entry_price = entry['entry_price']
-            amount = entry['amount']
+            entry_price = entry.get('entry_price')
+            amount = entry.get('amount', 0)
+            if not isinstance(entry_price, (int, float)) or entry_price <= 0:
+                print(f"⚠️ Entry price invalid for {symbol}; removing from tracking.")
+                open_positions.discard(symbol)
+                open_positions_data.pop(symbol, None)
+                save_bot_state()
+                continue
+            if amount <= 0:
+                print(f"⚠️ Position amount invalid for {symbol}; removing from tracking.")
+                open_positions.discard(symbol)
+                open_positions_data.pop(symbol, None)
+                save_bot_state()
+                continue
             change_pct = ((current_price - entry_price) / entry_price) * 100
 
-            if change_pct >= take_profit_pct:
-                send_telegram_alert(f"🎯 TAKE PROFIT HIT for {symbol} (+{change_pct:.2f}%)")
+            # === ATR-based exits ===
+            tp_level = entry_price + (3.5 * atr)
+            ts_level = entry_price - (2.0 * atr)
+            hs_level = entry_price - (2.5 * atr)
+
+            if current_price >= tp_level:
+                send_telegram_alert(f"🎯 ATR TAKE PROFIT HIT for {symbol} (+{change_pct:.2f}%)")
                 execute_trade(symbol, "sell", amount, current_price)
-            elif change_pct <= -hard_stop_pct:
-                send_telegram_alert(f"🛑 HARD STOP triggered for {symbol} ({change_pct:.2f}%)")
+            elif current_price <= hs_level:
+                send_telegram_alert(f"🛑 ATR HARD STOP triggered for {symbol} ({change_pct:.2f}%)")
                 execute_trade(symbol, "sell", amount, current_price)
-            elif change_pct <= -trailing_stop_pct:
-                send_telegram_alert(f"📉 TRAILING STOP triggered for {symbol} ({change_pct:.2f}%)")
+            elif current_price <= ts_level:
+                send_telegram_alert(f"📉 ATR TRAILING STOP triggered for {symbol} ({change_pct:.2f}%)")
                 execute_trade(symbol, "sell", amount, current_price)
             else:
                 print(f"⏳ {symbol} holding: {change_pct:.2f}%")
