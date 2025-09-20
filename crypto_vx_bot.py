@@ -677,15 +677,34 @@ def run_bot():
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
-            # Live trading mode with fixed $10 per trade
+            # Adaptive trade amount based on available USD balance
             try:
-                trade_amount_usd = 10.00  # Live trading with $10 per trade
-                print(f"💰 Live trading mode active. Fixed trade amount: ${trade_amount_usd}")
+                balance = exchange.fetch_balance()
+                free_balances = balance.get('free') or {}
+                usd_available = free_balances.get('USD')
+                if usd_available is None:
+                    usd_available = free_balances.get('ZUSD', 0)
+                usd_available = float(usd_available or 0)
+                if usd_available < 1:
+                    print("⚠️ Not enough free USD balance to trade.")
+                    time.sleep(10)
+                    continue
             except Exception as e:
-                send_telegram_alert(f"⚠️ Failed to set live trade amount: {e}")
-                trade_amount_usd = 10.00
+                send_telegram_alert(f"⚠️ Failed to fetch balance for dynamic trade sizing: {e}")
+                time.sleep(10)
+                continue
 
             pairs = scan_top_cryptos()
+            if not pairs:
+                print("⚠️ No valid pairs found.")
+                time.sleep(10)
+                continue
+
+            num_pairs = len(pairs)
+            total_allocatable = usd_available * 0.95
+            trade_amount_usd = round(total_allocatable / num_pairs, 2)
+            print(f"💰 Adaptive per-trade amount: ${trade_amount_usd} (Total USD: ${usd_available}, Allocatable: ${total_allocatable})")
+
             send_telegram_alert(f"🧠 Scanned top cryptos: {pairs}")
             for symbol in pairs:
                 print(f"📈 Evaluating {symbol}...")
