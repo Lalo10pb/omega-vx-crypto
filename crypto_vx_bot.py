@@ -3,7 +3,7 @@ import json
 import os
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 from dotenv import load_dotenv
 
 env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -32,6 +32,11 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 5))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
 LIMIT_PRICE_BUFFER = float(os.getenv("LIMIT_PRICE_BUFFER", 0.001))
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", 250_000))
+MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", 0.35))  # expressed in percent
+MAX_ATR_PERCENT = float(os.getenv("MAX_ATR_PERCENT", 0.07))
+FRESH_SIGNAL_LOOKBACK = int(os.getenv("FRESH_SIGNAL_LOOKBACK", 3))
+SCANNER_LOG_PATH = os.getenv("SCANNER_LOG_PATH", "scanner_evaluations.csv")
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -76,6 +81,115 @@ def calculate_rsi(prices, period=14):
             rs = up / down
             rsi.append(100. - 100. / (1. + rs))
     return rsi
+
+
+def calculate_ema_series(prices: List[float], period: int) -> List[float]:
+    if len(prices) < period:
+        return []
+    alpha = 2 / (period + 1)
+    ema_values: List[float] = []
+    ema: Optional[float] = None
+    for price in prices:
+        if ema is None:
+            ema = price
+        else:
+            ema = (price - ema) * alpha + ema
+        ema_values.append(ema)
+    return ema_values
+
+
+def calculate_adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[float]:
+    size = min(len(highs), len(lows), len(closes))
+    if size < period + 1:
+        return []
+    highs = np.array(highs[-(size):], dtype=float)
+    lows = np.array(lows[-(size):], dtype=float)
+    closes = np.array(closes[-(size):], dtype=float)
+
+    plus_dm = np.zeros(size)
+    minus_dm = np.zeros(size)
+    tr = np.zeros(size)
+
+    for i in range(1, size):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        plus_dm[i] = up_move if up_move > down_move and up_move > 0 else 0
+        minus_dm[i] = down_move if down_move > up_move and down_move > 0 else 0
+        tr_components = [highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])]
+        tr[i] = max(tr_components)
+
+    def _smooth(values: np.ndarray) -> np.ndarray:
+        smoothed = np.zeros_like(values)
+        smoothed[period] = values[1:period + 1].sum()
+        for i in range(period + 1, len(values)):
+            smoothed[i] = smoothed[i - 1] - (smoothed[i - 1] / period) + values[i]
+        return smoothed
+
+    smoothed_tr = _smooth(tr)
+    smoothed_plus = _smooth(plus_dm)
+    smoothed_minus = _smooth(minus_dm)
+
+    plus_di = np.where(smoothed_tr == 0, 0, 100 * (smoothed_plus / smoothed_tr))
+    minus_di = np.where(smoothed_tr == 0, 0, 100 * (smoothed_minus / smoothed_tr))
+    dx = np.where(
+        (plus_di + minus_di) == 0,
+        0,
+        100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    )
+
+    adx = np.zeros(size)
+    adx[:period * 2] = dx[:period * 2]
+    for i in range(period * 2, size):
+        adx[i] = ((adx[i - 1] * (period - 1)) + dx[i]) / period
+
+    return adx.tolist()
+
+
+def compute_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float], List[float]]:
+    if len(prices) < slow + signal:
+        return [], [], []
+    ema_fast = calculate_ema_series(prices, fast)
+    ema_slow = calculate_ema_series(prices, slow)
+    if not ema_fast or not ema_slow:
+        return [], [], []
+    ema_fast = np.array(ema_fast[-len(ema_slow):])
+    ema_slow = np.array(ema_slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = calculate_ema_series(macd_line.tolist(), signal)
+    if not signal_line:
+        return macd_line.tolist(), [], []
+    signal_line = np.array(signal_line[-len(macd_line):])
+    histogram = macd_line - signal_line
+    return macd_line.tolist(), signal_line.tolist(), histogram.tolist()
+
+
+def rate_of_change(prices: List[float], period: int = 10) -> Optional[float]:
+    if len(prices) <= period:
+        return None
+    past_price = prices[-period - 1]
+    latest_price = prices[-1]
+    if past_price <= 0:
+        return None
+    return ((latest_price - past_price) / past_price) * 100
+
+
+def compute_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if min(len(highs), len(lows), len(closes)) < period + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(closes)):
+        high = highs[i]
+        low = lows[i]
+        prev_close = closes[i - 1]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+    if len(true_ranges) < period:
+        return None
+    atr_window = true_ranges[-period:]
+    atr_values = calculate_ema_series(atr_window, period)
+    if not atr_values:
+        return None
+    return float(atr_values[-1])
 
 
 def send_telegram_alert(message):
@@ -355,7 +469,7 @@ def log_portfolio_snapshot():
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
-def execute_trade(symbol, side, amount, price=None):
+def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed"):
     now = time.time()
     if side == "buy":
         if symbol in open_positions:
@@ -524,7 +638,7 @@ def execute_trade(symbol, side, amount, price=None):
                 open_positions.discard(symbol)
                 open_positions_data.pop(symbol, None)
 
-        log_trade(symbol, side, filled_amount, executed_price, "Live trade executed")
+        log_trade(symbol, side, filled_amount, executed_price, reason)
         print(f"✅ {side.upper()} order filled for {symbol}: {filled_amount} @ ${executed_price:.4f} (status: {status})")
         save_bot_state()
     except Exception as e:
@@ -599,77 +713,380 @@ def monitor_positions():
 
             if current_price >= tp_level:
                 send_telegram_alert(f"🎯 ATR TAKE PROFIT HIT for {symbol} (+{change_pct:.2f}%)")
-                execute_trade(symbol, "sell", amount, current_price)
+                execute_trade(symbol, "sell", amount, current_price, reason="ATR take profit")
             elif current_price <= hs_level:
                 send_telegram_alert(f"🛑 ATR HARD STOP triggered for {symbol} ({change_pct:.2f}%)")
-                execute_trade(symbol, "sell", amount, current_price)
+                execute_trade(symbol, "sell", amount, current_price, reason="ATR hard stop")
             elif current_price <= ts_level:
                 send_telegram_alert(f"📉 ATR TRAILING STOP triggered for {symbol} ({change_pct:.2f}%)")
-                execute_trade(symbol, "sell", amount, current_price)
+                execute_trade(symbol, "sell", amount, current_price, reason="ATR trailing stop")
             else:
                 print(f"⏳ {symbol} holding: {change_pct:.2f}%")
         except Exception as e:
             send_telegram_alert(f"⚠️ monitor_positions error for {symbol}: {str(e)}")
 
 # === Improved Coin Scanner ===
-def scan_top_cryptos(limit=5):
+def log_scanner_snapshot(records: List[Dict]) -> None:
+    if not records:
+        return
     try:
-        print(f"🔍 Scanning {exchange_name.upper()} markets (BEST STRATEGY)...")
-        markets = exchange.load_markets()
-        scores = []
+        timestamp = datetime.now().isoformat()
+        file_exists = os.path.exists(SCANNER_LOG_PATH)
+        with open(SCANNER_LOG_PATH, mode='a', newline='') as log_file:
+            writer = csv.writer(log_file)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp",
+                    "symbol",
+                    "score",
+                    "quote_volume",
+                    "spread_pct",
+                    "atr_pct",
+                    "rsi_1h",
+                    "adx_1h",
+                    "volume_ratio",
+                    "macd_hist_slope",
+                    "roc_pct",
+                    "multi_timeframe_alignment",
+                    "fresh_signal_age",
+                    "reasons"
+                ])
+            for record in records:
+                indicators = record.get('indicators', {})
+                writer.writerow([
+                    timestamp,
+                    record.get('symbol'),
+                    record.get('score'),
+                    indicators.get('quote_volume'),
+                    indicators.get('spread_pct'),
+                    indicators.get('atr_pct'),
+                    indicators.get('rsi_1h'),
+                    indicators.get('adx_1h'),
+                    indicators.get('volume_ratio'),
+                    indicators.get('macd_hist_slope'),
+                    indicators.get('roc_pct'),
+                    indicators.get('timeframe_alignment'),
+                    indicators.get('fresh_signal_age'),
+                    " | ".join(record.get('reasons', []))
+                ])
+    except Exception as err:
+        print(f"⚠️ Failed to persist scanner snapshot: {err}")
 
-        # Handle quote currency for Kraken vs others
+
+def extract_quote_volume(ticker: Dict) -> Optional[float]:
+    if not isinstance(ticker, dict):
+        return None
+    for key in ("quoteVolume", "baseVolume", "volume", "volCcy24h", "volUsd24h", "vol24h"):
+        value = ticker.get(key)
+        if value:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    info = ticker.get('info') if isinstance(ticker.get('info'), dict) else {}
+    for key in ("quoteVolume", "volCcy24h", "volUsd24h", "vol24h"):
+        value = info.get(key)
+        if value:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def scan_top_cryptos(limit: int = 5) -> List[Dict[str, object]]:
+    try:
+        print(f"🔍 Scanning {exchange_name.upper()} markets with enhanced filters...")
+        markets = exchange.load_markets()
+        candidates: List[Dict[str, object]] = []
+
         if isinstance(exchange, ccxt.kraken):
             quote_currency = "/USD"
         else:
             quote_currency = "/USDT"
 
-        # Nebraska restricted tokens (or similar) filter keywords
         restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
 
-        for symbol in markets:
+        for symbol, market in markets.items():
             if not symbol.endswith(quote_currency):
                 continue
             if any(keyword in symbol for keyword in restricted_keywords):
                 continue
+            if market and not market.get('active', True):
+                continue
+
             try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-                if len(ohlcv) < 50:
-                    continue
-
-                closes = [c[4] for c in ohlcv]
-                volumes = [c[5] for c in ohlcv]
-
-                ema9 = calculate_ema(closes, period=9)[-1]
-                ema21 = calculate_ema(closes, period=21)[-1]
-                ema50 = calculate_ema(closes, period=50)[-1]
-                last_price = closes[-1]
-                rsi = calculate_rsi(closes)[-1]
-                avg_vol = np.mean(volumes[-20:])
-                curr_vol = volumes[-1]
-
-                score = 0
-                if ema9 > ema21 > ema50:
-                    score += 2
-                if 40 < rsi < 70:
-                    score += 1
-                if curr_vol > 2 * avg_vol:
-                    score += 1
-                if abs(closes[-1] - closes[-5]) / closes[-5] > 0.01:
-                    score += 1
-
-                if score >= 3:
-                    scores.append((symbol, score, rsi, last_price))
+                ticker = exchange.fetch_ticker(symbol)
             except Exception:
                 continue
 
-        scores.sort(key=lambda x: (-x[1], -x[2]))
-        top = [s[0] for s in scores[:limit]]
-        print("✅ BEST STRATEGY PICKS:", top)
-        return top
+            quote_volume = extract_quote_volume(ticker)
+            if quote_volume is None or quote_volume < MIN_QUOTE_VOLUME_24H:
+                continue
+
+            bid = ticker.get('bid')
+            ask = ticker.get('ask')
+            if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)):
+                continue
+            if bid <= 0 or ask <= 0 or ask <= bid:
+                continue
+            mid_price = (bid + ask) / 2
+            spread_pct = ((ask - bid) / mid_price) * 100 if mid_price > 0 else None
+            if spread_pct is None or spread_pct > MAX_SPREAD_PERCENT:
+                continue
+
+            try:
+                ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
+            except Exception:
+                continue
+            if not ohlcv_1h or len(ohlcv_1h) < 100:
+                continue
+
+            closes_1h = [c[4] for c in ohlcv_1h]
+            highs_1h = [c[2] for c in ohlcv_1h]
+            lows_1h = [c[3] for c in ohlcv_1h]
+            volumes_1h = [c[5] for c in ohlcv_1h]
+
+            if not closes_1h or closes_1h[-1] is None:
+                continue
+            last_price = float(closes_1h[-1])
+            if last_price <= 0:
+                continue
+
+            ema9_series = calculate_ema_series(closes_1h, 9)
+            ema21_series = calculate_ema_series(closes_1h, 21)
+            ema50_series = calculate_ema_series(closes_1h, 50)
+            if not ema9_series or not ema21_series or not ema50_series:
+                continue
+            ema9 = ema9_series[-1]
+            ema21 = ema21_series[-1]
+            ema50 = ema50_series[-1]
+
+            rsi_values = calculate_rsi(closes_1h)
+            if not rsi_values:
+                continue
+            rsi_1h = rsi_values[-1]
+
+            adx_values = calculate_adx(highs_1h, lows_1h, closes_1h)
+            adx_1h = adx_values[-1] if adx_values else None
+
+            atr_value = compute_atr(highs_1h, lows_1h, closes_1h)
+            atr_pct = (atr_value / last_price) if atr_value else None
+            if atr_pct and atr_pct > MAX_ATR_PERCENT:
+                continue
+
+            avg_vol_20 = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else None
+            volume_ratio = (volumes_1h[-1] / avg_vol_20) if avg_vol_20 else None
+
+            macd_line, signal_line, histogram = compute_macd(closes_1h)
+            macd_hist_slope = None
+            if histogram and len(histogram) >= 2:
+                macd_hist_slope = histogram[-1] - histogram[-2]
+
+            roc_pct = rate_of_change(closes_1h, period=6)
+
+            diff_series = None
+            fresh_signal_age = None
+            if ema9_series and ema21_series:
+                diff_series = np.array(ema9_series) - np.array(ema21_series)
+                max_lookback = min(len(diff_series) - 1, FRESH_SIGNAL_LOOKBACK + 5)
+                for lookback in range(1, max_lookback + 1):
+                    idx = -lookback
+                    prev_idx = idx - 1
+                    if abs(prev_idx) > len(diff_series):
+                        break
+                    if diff_series[idx] > 0 and diff_series[prev_idx] <= 0:
+                        fresh_signal_age = lookback - 1
+                        break
+
+            fresh_signal = fresh_signal_age is not None and fresh_signal_age <= FRESH_SIGNAL_LOOKBACK
+
+            timeframe_alignment_flags = []
+            try:
+                ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=120)
+            except Exception:
+                ohlcv_4h = []
+            try:
+                ohlcv_1d = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=120)
+            except Exception:
+                ohlcv_1d = []
+
+            def _trend_ok(ohlcv: List[List[float]]) -> bool:
+                if not ohlcv or len(ohlcv) < 60:
+                    return False
+                closes_tf = [c[4] for c in ohlcv]
+                ema9_tf = calculate_ema_series(closes_tf, 9)
+                ema21_tf = calculate_ema_series(closes_tf, 21)
+                if not ema9_tf or not ema21_tf:
+                    return False
+                return ema9_tf[-1] > ema21_tf[-1]
+
+            if _trend_ok(ohlcv_4h):
+                timeframe_alignment_flags.append('4h')
+            if _trend_ok(ohlcv_1d):
+                timeframe_alignment_flags.append('1d')
+
+            score = 0
+            reasons: List[str] = []
+
+            if ema9 > ema21 > ema50:
+                score += 2
+                reasons.append("1h EMA stack bullish")
+            if fresh_signal:
+                score += 1
+                reasons.append(f"Fresh EMA cross ({fresh_signal_age} bars ago)")
+            if 45 <= rsi_1h <= 75:
+                score += 1
+                reasons.append(f"RSI in momentum zone ({rsi_1h:.1f})")
+            if volume_ratio and volume_ratio >= 1.5:
+                score += 1
+                reasons.append(f"Volume x{volume_ratio:.2f} vs avg")
+            if adx_1h and adx_1h >= 20:
+                score += 1
+                reasons.append(f"ADX strong ({adx_1h:.1f})")
+            if macd_hist_slope and macd_hist_slope > 0:
+                score += 1
+                reasons.append("MACD momentum rising")
+            if roc_pct and roc_pct > 0.3:
+                score += 1
+                reasons.append(f"ROC positive ({roc_pct:.2f}%)")
+            if timeframe_alignment_flags:
+                score += len(timeframe_alignment_flags)
+                reasons.append("Multi-timeframe uptrend: " + ", ".join(timeframe_alignment_flags))
+
+            if score < 4:
+                continue
+
+            candidate = {
+                "symbol": symbol,
+                "score": score,
+                "reasons": reasons,
+                "indicators": {
+                    "last_price": last_price,
+                    "rsi_1h": rsi_1h,
+                    "adx_1h": adx_1h,
+                    "volume_ratio": volume_ratio,
+                    "macd_hist_slope": macd_hist_slope,
+                    "roc_pct": roc_pct,
+                    "atr_pct": atr_pct,
+                    "quote_volume": quote_volume,
+                    "spread_pct": spread_pct,
+                    "fresh_signal_age": fresh_signal_age,
+                    "timeframe_alignment": ",".join(timeframe_alignment_flags) if timeframe_alignment_flags else "",
+                }
+            }
+            candidates.append(candidate)
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: (-(item.get('score') or 0), -(item.get('indicators', {}).get('quote_volume') or 0)))
+        top_candidates = candidates[:limit]
+        log_scanner_snapshot(top_candidates)
+        print("✅ Scanner picks:", [(c['symbol'], c['score']) for c in top_candidates])
+        return top_candidates
     except Exception as e:
-        send_telegram_alert(f"❌ Best-strategy scan error: {e}")
+        send_telegram_alert(f"❌ Enhanced scan error: {e}")
         return []
+
+
+def validate_entry_conditions(symbol: str) -> Tuple[bool, str, Dict[str, float]]:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+    except Exception as err:
+        return False, f"Ticker fetch failed: {err}", {}
+
+    quote_volume = extract_quote_volume(ticker)
+    if quote_volume is None or quote_volume < MIN_QUOTE_VOLUME_24H:
+        return False, "Quote volume below minimum threshold", {}
+
+    bid = ticker.get('bid')
+    ask = ticker.get('ask')
+    if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)) or bid <= 0 or ask <= 0 or ask <= bid:
+        return False, "Spread check failed", {}
+    mid_price = (bid + ask) / 2
+    spread_pct = ((ask - bid) / mid_price) * 100 if mid_price > 0 else None
+    if spread_pct is None or spread_pct > MAX_SPREAD_PERCENT:
+        return False, "Spread too wide", {}
+
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
+    except Exception as err:
+        return False, f"OHLCV fetch failed: {err}", {}
+
+    if not ohlcv or len(ohlcv) < 80:
+        return False, "Insufficient OHLCV data", {}
+
+    closes = [c[4] for c in ohlcv]
+    highs = [c[2] for c in ohlcv]
+    lows = [c[3] for c in ohlcv]
+    volumes = [c[5] for c in ohlcv]
+
+    if not closes or closes[-1] is None:
+        return False, "Invalid close data", {}
+
+    last_price = float(closes[-1])
+    if last_price <= 0:
+        return False, "Last price invalid", {}
+
+    ema9_series = calculate_ema_series(closes, 9)
+    ema21_series = calculate_ema_series(closes, 21)
+    ema50_series = calculate_ema_series(closes, 50)
+    if not ema9_series or not ema21_series or not ema50_series:
+        return False, "EMA series unavailable", {}
+
+    ema9 = ema9_series[-1]
+    ema21 = ema21_series[-1]
+    ema50 = ema50_series[-1]
+    if not (ema9 > ema21 > ema50):
+        return False, "EMA stack lost", {}
+
+    rsi_values = calculate_rsi(closes)
+    if not rsi_values:
+        return False, "RSI unavailable", {}
+    rsi = rsi_values[-1]
+    if rsi < 40 or rsi > 78:
+        return False, f"RSI out of range ({rsi:.1f})", {}
+
+    atr_value = compute_atr(highs, lows, closes)
+    atr_pct = (atr_value / last_price) if atr_value else None
+    if atr_pct and atr_pct > MAX_ATR_PERCENT:
+        return False, f"ATR too high ({atr_pct:.3f})", {}
+
+    avg_vol_20 = np.mean(volumes[-20:]) if len(volumes) >= 20 else None
+    volume_ratio = (volumes[-1] / avg_vol_20) if avg_vol_20 else None
+    if volume_ratio and volume_ratio < 1.0:
+        return False, "Volume momentum faded", {}
+
+    return True, "", {
+        "last_price": last_price,
+        "quote_volume": quote_volume,
+        "spread_pct": spread_pct,
+        "rsi": rsi,
+        "atr_pct": atr_pct,
+        "volume_ratio": volume_ratio,
+    }
+
+
+def allocate_trade_sizes(candidates: List[Dict[str, object]], total_allocatable: float) -> Dict[str, float]:
+    if total_allocatable <= 0 or not candidates:
+        return {}
+    weights = []
+    for candidate in candidates:
+        indicators = candidate.get('indicators', {})
+        atr_pct = indicators.get('atr_pct') or 0.02
+        atr_pct = max(float(atr_pct), 0.01)
+        weights.append(1 / atr_pct)
+    weight_sum = sum(weights)
+    allocations: Dict[str, float] = {}
+    if weight_sum <= 0:
+        per_symbol = total_allocatable / len(candidates)
+        for candidate in candidates:
+            allocations[candidate['symbol']] = per_symbol
+        return allocations
+    for candidate, weight in zip(candidates, weights):
+        allocations[candidate['symbol']] = total_allocatable * (weight / weight_sum)
+    return allocations
 
 # === Main Bot Loop ===
 def run_bot():
@@ -694,29 +1111,59 @@ def run_bot():
                 time.sleep(10)
                 continue
 
-            pairs = scan_top_cryptos()
-            if not pairs:
+            candidates = scan_top_cryptos()
+            if not candidates:
                 print("⚠️ No valid pairs found.")
                 time.sleep(10)
                 continue
 
-            num_pairs = len(pairs)
             total_allocatable = usd_available * 0.95
-            trade_amount_usd = round(total_allocatable / num_pairs, 2)
-            print(f"💰 Adaptive per-trade amount: ${trade_amount_usd} (Total USD: ${usd_available}, Allocatable: ${total_allocatable})")
+            allocations = allocate_trade_sizes(candidates, total_allocatable)
+            print(
+                f"💰 Total USD: ${usd_available:.2f}, Allocatable: ${total_allocatable:.2f}, "
+                f"Candidates: {[(c['symbol'], round(allocations.get(c['symbol'], 0), 2)) for c in candidates]}"
+            )
 
-            send_telegram_alert(f"🧠 Scanned top cryptos: {pairs}")
-            for symbol in pairs:
-                print(f"📈 Evaluating {symbol}...")
-                try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-                    closes = [candle[4] for candle in ohlcv]
-                    price = closes[-1]
-                    amount = round(trade_amount_usd / price, 6)
-                    print(f"✅ {symbol} passed filters. Forcing test trade.")
-                    execute_trade(symbol, "buy", amount)
-                except Exception as e:
-                    send_telegram_alert(f"⚠️ Error evaluating {symbol}: {str(e)}")
+            summary = ", ".join([f"{c['symbol']} (score {c['score']})" for c in candidates])
+            send_telegram_alert(f"🧠 Scanner picks: {summary}")
+
+            for candidate in candidates:
+                symbol = candidate['symbol']
+                usd_budget = allocations.get(symbol, 0)
+                if usd_budget <= 0:
+                    print(f"⚠️ No USD allocation for {symbol}; skipping.")
+                    continue
+                if symbol in open_positions:
+                    print(f"⏸️ Already holding {symbol}; skipping new entry.")
+                    continue
+
+                valid, rejection_reason, metrics = validate_entry_conditions(symbol)
+                if not valid:
+                    print(f"🚫 {symbol} entry blocked: {rejection_reason}")
+                    continue
+
+                price = metrics.get('last_price') or candidate.get('indicators', {}).get('last_price')
+                if not price or price <= 0:
+                    print(f"⚠️ Unable to determine price for {symbol}; skipping.")
+                    continue
+
+                amount = round(usd_budget / price, 6)
+                if amount <= 0:
+                    print(f"⚠️ Computed trade amount invalid for {symbol}; skipping.")
+                    continue
+
+                spread_value = metrics.get('spread_pct')
+                spread_text = f"{spread_value:.3f}%" if isinstance(spread_value, (int, float)) else "N/A"
+                entry_reason = "Scanner entry"
+                reason_components = candidate.get('reasons')
+                if reason_components:
+                    entry_reason = "Scanner entry: " + "; ".join(reason_components)
+
+                print(
+                    f"✅ Executing candidate {symbol}: USD ${usd_budget:.2f}, amount {amount}, "
+                    f"spread {spread_text}"
+                )
+                execute_trade(symbol, "buy", amount, reason=entry_reason)
 
             monitor_positions()
             log_portfolio_snapshot()
