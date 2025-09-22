@@ -32,6 +32,9 @@ markets_cache: Dict[str, dict] = {}
 markets_last_load: float = 0.0
 ohlcv_cache: Dict[Tuple[str, str, int], Dict[str, object]] = {}
 
+regime_last_check: float = 0.0
+regime_last_result: Tuple[bool, str] = (True, "init")
+
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 5))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
@@ -49,6 +52,18 @@ PREFERRED_QUOTES = [
     for q in os.getenv("PREFERRED_QUOTES", "USD,USDT,USDC,USDD,DAI,BUSD").split(",")
     if q.strip()
 ]
+HARD_STOP_PERCENT = float(os.getenv("HARD_STOP_PERCENT", 3.0))
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", 0.02))
+ATR_TRAIL_MULTIPLIER = float(os.getenv("ATR_TRAIL_MULTIPLIER", 1.5))
+ATR_TAKE_PROFIT_MULTIPLIER = float(os.getenv("ATR_TAKE_PROFIT_MULTIPLIER", 3.5))
+ATR_HARD_STOP_MULTIPLIER = float(os.getenv("ATR_HARD_STOP_MULTIPLIER", 2.5))
+REGIME_SYMBOL = os.getenv("REGIME_SYMBOL", "BTC/USD")
+REGIME_TIMEFRAME = os.getenv("REGIME_TIMEFRAME", "4h")
+REGIME_EMA_FAST = int(os.getenv("REGIME_EMA_FAST", 21))
+REGIME_EMA_SLOW = int(os.getenv("REGIME_EMA_SLOW", 50))
+REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", 180))
+REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", -1.0))
+REGIME_CACHE_SECONDS = int(os.getenv("REGIME_CACHE_SECONDS", 300))
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -719,7 +734,8 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             open_positions.add(symbol)
             open_positions_data[symbol] = {
                 "entry_price": executed_price,
-                "amount": filled_amount
+                "amount": filled_amount,
+                "peak_price": executed_price,
             }
         else:
             position = open_positions_data.get(symbol, {})
@@ -741,14 +757,10 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
         send_telegram_alert(f"❌ Trade execution failed: {e}")
         print(f"❌ Trade execution failed: {e}")
 
-# === SELL LOGIC CONFIG ===
-trailing_stop_pct = 4.5  # widened to reduce false exits from micro swings
-take_profit_pct = 6.0    # increased target to capture stronger breakouts
-hard_stop_pct = 4.0      # allows slightly more downside to avoid noise
-
 # === Monitor & Auto-Close Open Positions ===
 def monitor_positions():
     print("🔍 Monitoring open positions...")
+    state_dirty = False
     for symbol in list(open_positions):
         try:
             ohlcv = fetch_ohlcv_cached(symbol, timeframe='1h', limit=50, ttl=60)
@@ -759,7 +771,6 @@ def monitor_positions():
             highs = [candle[2] for candle in ohlcv]
             lows = [candle[3] for candle in ohlcv]
 
-            # === ATR calculation ===
             tr_list = []
             for i in range(1, len(closes)):
                 high = highs[i]
@@ -783,11 +794,13 @@ def monitor_positions():
             if not isinstance(current_price, (int, float)) or current_price <= 0:
                 print(f"⚠️ Current price invalid for {symbol}; skipping.")
                 continue
+
             entry = open_positions_data.get(symbol, {})
             if not entry:
                 continue
             entry_price = entry.get('entry_price')
             amount = entry.get('amount', 0)
+            peak_price = entry.get('peak_price') or entry_price
             if not isinstance(entry_price, (int, float)) or entry_price <= 0:
                 print(f"⚠️ Entry price invalid for {symbol}; removing from tracking.")
                 open_positions.discard(symbol)
@@ -800,26 +813,56 @@ def monitor_positions():
                 open_positions_data.pop(symbol, None)
                 save_bot_state()
                 continue
+
             change_pct = ((current_price - entry_price) / entry_price) * 100
 
-            # === ATR-based exits ===
-            tp_level = entry_price + (3.5 * atr)
-            ts_level = entry_price - (2.0 * atr)
-            hs_level = entry_price - (2.5 * atr)
+            if current_price > peak_price:
+                entry['peak_price'] = current_price
+                peak_price = current_price
+                state_dirty = True
 
-            if current_price >= tp_level:
-                send_telegram_alert(f"🎯 ATR TAKE PROFIT HIT for {symbol} (+{change_pct:.2f}%)")
-                execute_trade(symbol, "sell", amount, current_price, reason="ATR take profit")
-            elif current_price <= hs_level:
-                send_telegram_alert(f"🛑 ATR HARD STOP triggered for {symbol} ({change_pct:.2f}%)")
+            percent_stop_price = entry_price * (1 - HARD_STOP_PERCENT / 100)
+            tp_level = entry_price + (ATR_TAKE_PROFIT_MULTIPLIER * atr)
+            atr_trailing_level = peak_price - (ATR_TRAIL_MULTIPLIER * atr)
+            atr_hard_level = entry_price - (ATR_HARD_STOP_MULTIPLIER * atr)
+            atr_trailing_level = max(atr_trailing_level, percent_stop_price)
+
+            atr_stop_pct = (ATR_HARD_STOP_MULTIPLIER * atr / entry_price) * 100
+            trail_stop_pct = (
+                ((peak_price - atr_trailing_level) / peak_price) * 100
+                if peak_price else None
+            )
+
+            if change_pct <= -HARD_STOP_PERCENT:
+                send_telegram_alert(
+                    f"🛑 HARD {HARD_STOP_PERCENT:.2f}% STOP triggered for {symbol} ({change_pct:.2f}%)"
+                )
+                execute_trade(symbol, "sell", amount, current_price, reason=f"Hard {HARD_STOP_PERCENT:.2f}% stop")
+            elif current_price <= atr_hard_level:
+                send_telegram_alert(
+                    f"🛑 ATR HARD STOP triggered for {symbol} ({change_pct:.2f}%, ATR stop {atr_stop_pct:.2f}%)"
+                )
                 execute_trade(symbol, "sell", amount, current_price, reason="ATR hard stop")
-            elif current_price <= ts_level:
-                send_telegram_alert(f"📉 ATR TRAILING STOP triggered for {symbol} ({change_pct:.2f}%)")
+            elif current_price <= atr_trailing_level:
+                send_telegram_alert(
+                    f"📉 ATR TRAILING STOP triggered for {symbol} ({change_pct:.2f}%, trail {trail_stop_pct:.2f}% from peak)"
+                )
                 execute_trade(symbol, "sell", amount, current_price, reason="ATR trailing stop")
+            elif current_price >= tp_level:
+                send_telegram_alert(
+                    f"🎯 ATR TAKE PROFIT HIT for {symbol} (+{change_pct:.2f}%)"
+                )
+                execute_trade(symbol, "sell", amount, current_price, reason="ATR take profit")
             else:
-                print(f"⏳ {symbol} holding: {change_pct:.2f}%")
+                print(
+                    f"⏳ {symbol} holding: {change_pct:.2f}% | peak ${peak_price:.4f} | "
+                    f"hard stop @ ${percent_stop_price:.4f} | atr hard @ ${atr_hard_level:.4f} | "
+                    f"trail @ ${atr_trailing_level:.4f} | tp @ ${tp_level:.4f}"
+                )
         except Exception as e:
             send_telegram_alert(f"⚠️ monitor_positions error for {symbol}: {str(e)}")
+    if state_dirty:
+        save_bot_state()
 
 # === Improved Coin Scanner ===
 def log_scanner_snapshot(records: List[Dict]) -> None:
@@ -1165,6 +1208,78 @@ def validate_entry_conditions(symbol: str) -> Tuple[bool, str, Dict[str, float]]
     }
 
 
+def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
+    global regime_last_check, regime_last_result
+    now = time.time()
+    if not force and (now - regime_last_check) < REGIME_CACHE_SECONDS and regime_last_result is not None:
+        return regime_last_result
+
+    minimum_required = max(REGIME_LOOKBACK // 2, REGIME_EMA_SLOW * 3)
+    try:
+        ohlcv = fetch_ohlcv_cached(
+            REGIME_SYMBOL,
+            timeframe=REGIME_TIMEFRAME,
+            limit=max(REGIME_LOOKBACK, minimum_required),
+            ttl=REGIME_CACHE_SECONDS,
+        )
+    except Exception as err:
+        reason = f"Regime check failed: {err}"
+        regime_last_result = (False, reason)
+        regime_last_check = now
+        return regime_last_result
+
+    if not ohlcv or len(ohlcv) < minimum_required:
+        reason = "Insufficient regime OHLCV data"
+        regime_last_result = (False, reason)
+        regime_last_check = now
+        return regime_last_result
+
+    closes = [c[4] for c in ohlcv if isinstance(c[4], (int, float)) and c[4] > 0]
+    if len(closes) < minimum_required:
+        reason = "Regime close data invalid"
+        regime_last_result = (False, reason)
+        regime_last_check = now
+        return regime_last_result
+
+    ema_fast_series = calculate_ema_series(closes, REGIME_EMA_FAST)
+    ema_slow_series = calculate_ema_series(closes, REGIME_EMA_SLOW)
+    if not ema_fast_series or not ema_slow_series:
+        reason = "Regime EMA data missing"
+        regime_last_result = (False, reason)
+        regime_last_check = now
+        return regime_last_result
+
+    ema_fast = ema_fast_series[-1]
+    ema_slow = ema_slow_series[-1]
+    roc_period = min(max(REGIME_EMA_SLOW, 10), len(closes) - 2)
+    roc_value = rate_of_change(closes, period=roc_period)
+    if roc_value is None:
+        roc_value = 0.0
+
+    bullish = ema_fast > ema_slow and roc_value >= REGIME_MIN_ROC
+    if bullish:
+        reason = (
+            f"EMA{REGIME_EMA_FAST}>{REGIME_EMA_SLOW} ({ema_fast:.2f}>{ema_slow:.2f}) "
+            f"and ROC {roc_value:.2f}%"
+        )
+    else:
+        condition = "EMA stack" if ema_fast <= ema_slow else "ROC"
+        reason = (
+            f"Regime defensive: {condition} check failed "
+            f"(EMA{REGIME_EMA_FAST}={ema_fast:.2f}, EMA{REGIME_EMA_SLOW}={ema_slow:.2f}, ROC={roc_value:.2f}%)"
+        )
+
+    previous_state = regime_last_result[0] if regime_last_result else None
+    regime_last_result = (bullish, reason)
+    regime_last_check = now
+
+    if previous_state is None or previous_state != bullish:
+        status = "BULLISH" if bullish else "DEFENSIVE"
+        send_telegram_alert(f"🧭 Market regime -> {status}: {reason}")
+
+    return regime_last_result
+
+
 def allocate_trade_sizes(candidates: List[Dict[str, object]], total_allocatable: float) -> Dict[str, float]:
     if total_allocatable <= 0 or not candidates:
         return {}
@@ -1191,6 +1306,13 @@ def run_bot():
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
+            monitor_positions()
+            regime_ok, regime_reason = evaluate_market_regime()
+            if not regime_ok:
+                print(f"🛡️ Standing down: {regime_reason}")
+                time.sleep(30)
+                continue
+
             # Adaptive trade amount based on available quote balance
             try:
                 balance = exchange.fetch_balance()
@@ -1213,6 +1335,7 @@ def run_bot():
 
             total_allocatable = quote_available * 0.95
             allocations = allocate_trade_sizes(candidates, total_allocatable)
+            risk_budget_remaining = max(quote_available * RISK_PER_TRADE_PCT, 0.0)
             print(
                 f"💰 Total {quote_asset}: {quote_available:.2f}, Allocatable: {total_allocatable:.2f}, "
                 f"Candidates: {[(c['symbol'], round(allocations.get(c['symbol'], 0), 2)) for c in candidates]}"
@@ -1230,6 +1353,9 @@ def run_bot():
                 if symbol in open_positions:
                     print(f"⏸️ Already holding {symbol}; skipping new entry.")
                     continue
+                if risk_budget_remaining <= 0:
+                    print("⚠️ Risk budget exhausted; skipping remaining candidates.")
+                    break
 
                 valid, rejection_reason, metrics = validate_entry_conditions(symbol)
                 if not valid:
@@ -1241,6 +1367,21 @@ def run_bot():
                     print(f"⚠️ Unable to determine price for {symbol}; skipping.")
                     continue
 
+                atr_pct = metrics.get('atr_pct')
+                atr_stop_pct = None
+                if isinstance(atr_pct, (int, float)) and atr_pct > 0:
+                    atr_stop_pct = ATR_HARD_STOP_MULTIPLIER * float(atr_pct)
+                effective_stop_pct = HARD_STOP_PERCENT / 100
+                if atr_stop_pct and atr_stop_pct > 0:
+                    effective_stop_pct = min(effective_stop_pct, atr_stop_pct)
+                effective_stop_pct = max(effective_stop_pct, 0.0001)
+
+                max_position_from_risk = risk_budget_remaining / effective_stop_pct
+                if max_position_from_risk <= 0:
+                    print("⚠️ No remaining risk capacity; stopping entries.")
+                    break
+
+                quote_budget = min(quote_budget, max_position_from_risk)
                 amount = quote_budget / price
                 if amount <= 0:
                     print(f"⚠️ Computed trade amount invalid for {symbol}; skipping.")
@@ -1255,11 +1396,12 @@ def run_bot():
 
                 print(
                     f"✅ Executing candidate {symbol}: {quote_asset} {quote_budget:.2f}, amount {amount:.6f}, "
-                    f"spread {spread_text}"
+                    f"spread {spread_text}, stop risk {effective_stop_pct * 100:.2f}%"
                 )
                 execute_trade(symbol, "buy", amount, reason=entry_reason)
+                trade_risk_used = quote_budget * effective_stop_pct
+                risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
 
-            monitor_positions()
             log_portfolio_snapshot()
             now_dt = datetime.now()
             if now_dt.weekday() == 6 and now_dt.hour == 17 and now_dt.minute < 5:
