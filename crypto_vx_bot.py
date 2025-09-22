@@ -28,6 +28,10 @@ last_trade_time = defaultdict(lambda: 0)
 COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
 
+markets_cache: Dict[str, dict] = {}
+markets_last_load: float = 0.0
+ohlcv_cache: Dict[Tuple[str, str, int], Dict[str, object]] = {}
+
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 5))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
@@ -37,6 +41,14 @@ MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", 0.35))  # expressed i
 MAX_ATR_PERCENT = float(os.getenv("MAX_ATR_PERCENT", 0.07))
 FRESH_SIGNAL_LOOKBACK = int(os.getenv("FRESH_SIGNAL_LOOKBACK", 3))
 SCANNER_LOG_PATH = os.getenv("SCANNER_LOG_PATH", "scanner_evaluations.csv")
+MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", 900))
+OHLCV_CACHE_TTL_SECONDS = int(os.getenv("OHLCV_CACHE_TTL_SECONDS", 90))
+MULTI_TF_CACHE_TTL_SECONDS = int(os.getenv("MULTI_TF_CACHE_TTL_SECONDS", 300))
+PREFERRED_QUOTES = [
+    q.strip().upper()
+    for q in os.getenv("PREFERRED_QUOTES", "USD,USDT,USDC,USDD,DAI,BUSD").split(",")
+    if q.strip()
+]
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -129,13 +141,22 @@ def calculate_adx(highs: List[float], lows: List[float], closes: List[float], pe
     smoothed_plus = _smooth(plus_dm)
     smoothed_minus = _smooth(minus_dm)
 
-    plus_di = np.where(smoothed_tr == 0, 0, 100 * (smoothed_plus / smoothed_tr))
-    minus_di = np.where(smoothed_tr == 0, 0, 100 * (smoothed_minus / smoothed_tr))
-    dx = np.where(
-        (plus_di + minus_di) == 0,
-        0,
-        100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    plus_di = np.zeros(size)
+    minus_di = np.zeros(size)
+    np.divide(smoothed_plus, smoothed_tr, out=plus_di, where=smoothed_tr > 0)
+    np.divide(smoothed_minus, smoothed_tr, out=minus_di, where=smoothed_tr > 0)
+    plus_di *= 100
+    minus_di *= 100
+
+    direction_sum = plus_di + minus_di
+    dx = np.zeros(size)
+    np.divide(
+        np.abs(plus_di - minus_di),
+        direction_sum,
+        out=dx,
+        where=direction_sum > 0
     )
+    dx *= 100
 
     adx = np.zeros(size)
     adx[:period * 2] = dx[:period * 2]
@@ -274,6 +295,11 @@ else:
 
 
 # === Order Utility Helpers ===
+DEFAULT_QUOTE_ASSET = os.getenv("DEFAULT_QUOTE_ASSET")
+if DEFAULT_QUOTE_ASSET:
+    DEFAULT_QUOTE_ASSET = DEFAULT_QUOTE_ASSET.upper()
+else:
+    DEFAULT_QUOTE_ASSET = "USD" if exchange_name == "kraken" else "USDT"
 
 def extract_valid_price(ticker: dict) -> Optional[float]:
     """Return the first positive price from common ticker fields."""
@@ -360,6 +386,64 @@ def save_bot_state() -> None:
         print(f"⚠️ Failed to persist bot state: {err}")
 
 
+def get_markets(force: bool = False) -> Dict[str, dict]:
+    global markets_cache, markets_last_load
+    now = time.time()
+    if force or not markets_cache or (now - markets_last_load) > MARKET_REFRESH_SECONDS:
+        try:
+            markets_cache = exchange.load_markets()
+            markets_last_load = now
+        except Exception as err:
+            print(f"⚠️ Failed to refresh markets: {err}")
+    return markets_cache
+
+
+def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int, ttl: Optional[int] = None) -> List[List[float]]:
+    if ttl is None:
+        ttl = MULTI_TF_CACHE_TTL_SECONDS if timeframe in {"4h", "1d", "1w"} else OHLCV_CACHE_TTL_SECONDS
+    key = (symbol, timeframe, limit)
+    now = time.time()
+    cached = ohlcv_cache.get(key)
+    if cached and now - cached['ts'] < ttl:
+        return cached['data']
+    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    ohlcv_cache[key] = {'ts': now, 'data': data}
+    return data
+
+
+def reconcile_quote_alias(balance_key: str) -> str:
+    if balance_key.startswith('Z') and len(balance_key) > 1:
+        return balance_key[1:]
+    return balance_key
+
+
+def pick_quote_balance(free_balances: Dict[str, float]) -> Tuple[str, float]:
+    normalized = {reconcile_quote_alias(k.upper()): float(v or 0) for k, v in (free_balances or {}).items()}
+    candidates = PREFERRED_QUOTES or [DEFAULT_QUOTE_ASSET]
+    if DEFAULT_QUOTE_ASSET not in candidates:
+        candidates = [DEFAULT_QUOTE_ASSET] + candidates
+    for code in candidates:
+        amount = normalized.get(code)
+        if amount and amount > 0:
+            return code, amount
+    return DEFAULT_QUOTE_ASSET, float(normalized.get(DEFAULT_QUOTE_ASSET, 0.0))
+
+
+def normalize_order_values(symbol: str, price: float, amount: float) -> Tuple[float, float]:
+    get_markets()
+    precise_price = price
+    precise_amount = amount
+    try:
+        precise_amount = float(exchange.amount_to_precision(symbol, amount))
+    except Exception as err:
+        print(f"⚠️ amount_to_precision failed for {symbol}: {err}")
+    try:
+        precise_price = float(exchange.price_to_precision(symbol, price))
+    except Exception as err:
+        print(f"⚠️ price_to_precision failed for {symbol}: {err}")
+    return precise_price, precise_amount
+
+
 def current_total_exposure() -> float:
     exposure = 0.0
     for info in open_positions_data.values():
@@ -371,6 +455,7 @@ def current_total_exposure() -> float:
 
 
 load_bot_state()
+get_markets(force=True)
 
 
 def get_gspread_client():
@@ -413,7 +498,9 @@ def log_trade(symbol, side, amount, price, reason):
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log trade to Google Sheet tab '{trade_tab}': {str(e)}")
 
-    send_telegram_alert(f"📒 LOGGED TRADE: {side.upper()} {symbol} | Amount: {amount} @ ${price:.2f} ({reason})")
+    send_telegram_alert(
+        f"📒 LOGGED TRADE: {side.upper()} {symbol} | Amount: {amount} @ {price:.4f} ({reason})"
+    )
 
 def log_portfolio_snapshot():
     try:
@@ -534,11 +621,6 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             return
 
         available_volume = sum(level[1] for level in side_levels if isinstance(level[1], (int, float)))
-        if side == "buy" and available_volume < amount:
-            message = f"⚠️ Not enough liquidity to buy {amount} {symbol}; available {available_volume:.4f}."
-            print(message)
-            send_telegram_alert(message)
-            return
         if side == "sell":
             position = open_positions_data.get(symbol, {})
             position_amount = position.get('amount', 0)
@@ -548,25 +630,36 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 print(message)
                 send_telegram_alert(message)
                 return
-            if available_volume < amount:
-                message = f"⚠️ Not enough liquidity to sell {amount} {symbol}; available {available_volume:.4f}."
-                print(message)
-                send_telegram_alert(message)
-                return
 
         fallback_price = price if isinstance(price, (int, float)) and price > 0 else reference_price
-        if LIMIT_PRICE_BUFFER < 0:
-            buffer = 0.0
-        else:
-            buffer = LIMIT_PRICE_BUFFER
+        buffer = max(LIMIT_PRICE_BUFFER, 0.0)
         if side == "buy":
-            limit_price = book_price * (1 + buffer)
+            limit_price = book_price if buffer == 0 else book_price * (1 + buffer)
+            if fallback_price and buffer > 0:
+                limit_price = min(limit_price, fallback_price * (1 + buffer))
         else:
-            limit_price = book_price * (1 - buffer)
+            limit_price = book_price if buffer == 0 else book_price * (1 - buffer)
+            if fallback_price and buffer > 0:
+                limit_price = max(limit_price, fallback_price * (1 - buffer))
 
-        limit_price = round(limit_price, 8)
+        limit_price, precise_amount = normalize_order_values(symbol, limit_price, amount)
+        amount = precise_amount
         if limit_price <= 0:
             message = f"⚠️ Computed limit price invalid for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+        if amount <= 0:
+            message = f"⚠️ Order size rounded to zero for {symbol}; skipping {side} order."
+            print(message)
+            send_telegram_alert(message)
+            return
+
+        if available_volume < amount:
+            message = (
+                f"⚠️ Not enough liquidity to {side} {amount} {symbol}; "
+                f"available {available_volume:.4f}."
+            )
             print(message)
             send_telegram_alert(message)
             return
@@ -575,7 +668,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             projected_exposure = current_total_exposure() + (fallback_price * amount)
             if projected_exposure > MAX_TOTAL_EXPOSURE_USD:
                 message = (
-                    f"🚫 Exposure cap hit: projected ${projected_exposure:.2f} exceeds ${MAX_TOTAL_EXPOSURE_USD:.2f}; "
+                    f"🚫 Exposure cap hit: projected {projected_exposure:.2f} exceeds {MAX_TOTAL_EXPOSURE_USD:.2f}; "
                     f"skipping {symbol} buy."
                 )
                 print(message)
@@ -590,7 +683,10 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             send_telegram_alert(f"❌ Invalid trade side: {side}")
             return
 
-        print(f"📍LIMIT {side.upper()} for {symbol} @ ${limit_price} (amount: {amount}) placed; waiting for fill...")
+        print(
+            f"📍LIMIT {side.upper()} for {symbol} @ {limit_price:.8f} "
+            f"(amount: {amount:.6f}) placed; waiting for fill..."
+        )
         final_order = wait_for_order_fill(symbol, order)
         status = final_order.get('status')
         filled_amount = float(final_order.get('filled') or 0.0)
@@ -655,7 +751,7 @@ def monitor_positions():
     print("🔍 Monitoring open positions...")
     for symbol in list(open_positions):
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+            ohlcv = fetch_ohlcv_cached(symbol, timeframe='1h', limit=50, ttl=60)
             if not ohlcv or len(ohlcv) < 2:
                 print(f"⚠️ Insufficient OHLCV data for {symbol}; skipping monitoring cycle.")
                 continue
@@ -794,21 +890,22 @@ def extract_quote_volume(ticker: Dict) -> Optional[float]:
     return None
 
 
-def scan_top_cryptos(limit: int = 5) -> List[Dict[str, object]]:
+def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[Dict[str, object]]:
     try:
-        print(f"🔍 Scanning {exchange_name.upper()} markets with enhanced filters...")
-        markets = exchange.load_markets()
+        quote_asset = (quote_asset or DEFAULT_QUOTE_ASSET).upper()
+        print(f"🔍 Scanning {exchange_name.upper()} {quote_asset} markets with enhanced filters...")
+        markets = get_markets()
         candidates: List[Dict[str, object]] = []
-
-        if isinstance(exchange, ccxt.kraken):
-            quote_currency = "/USD"
-        else:
-            quote_currency = "/USDT"
+        symbol_suffix = f"/{quote_asset}"
 
         restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
 
         for symbol, market in markets.items():
-            if not symbol.endswith(quote_currency):
+            market_quote = (market or {}).get('quote')
+            if market_quote:
+                if str(market_quote).upper() != quote_asset:
+                    continue
+            elif not symbol.endswith(symbol_suffix):
                 continue
             if any(keyword in symbol for keyword in restricted_keywords):
                 continue
@@ -836,7 +933,7 @@ def scan_top_cryptos(limit: int = 5) -> List[Dict[str, object]]:
                 continue
 
             try:
-                ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
+                ohlcv_1h = fetch_ohlcv_cached(symbol, timeframe='1h', limit=200)
             except Exception:
                 continue
             if not ohlcv_1h or len(ohlcv_1h) < 100:
@@ -903,11 +1000,11 @@ def scan_top_cryptos(limit: int = 5) -> List[Dict[str, object]]:
 
             timeframe_alignment_flags = []
             try:
-                ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=120)
+                ohlcv_4h = fetch_ohlcv_cached(symbol, timeframe='4h', limit=120)
             except Exception:
                 ohlcv_4h = []
             try:
-                ohlcv_1d = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=120)
+                ohlcv_1d = fetch_ohlcv_cached(symbol, timeframe='1d', limit=120)
             except Exception:
                 ohlcv_1d = []
 
@@ -1010,7 +1107,7 @@ def validate_entry_conditions(symbol: str) -> Tuple[bool, str, Dict[str, float]]
         return False, "Spread too wide", {}
 
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
+        ohlcv = fetch_ohlcv_cached(symbol, timeframe='1h', limit=150, ttl=OHLCV_CACHE_TTL_SECONDS)
     except Exception as err:
         return False, f"OHLCV fetch failed: {err}", {}
 
@@ -1094,16 +1191,13 @@ def run_bot():
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
-            # Adaptive trade amount based on available USD balance
+            # Adaptive trade amount based on available quote balance
             try:
                 balance = exchange.fetch_balance()
                 free_balances = balance.get('free') or {}
-                usd_available = free_balances.get('USD')
-                if usd_available is None:
-                    usd_available = free_balances.get('ZUSD', 0)
-                usd_available = float(usd_available or 0)
-                if usd_available < 1:
-                    print("⚠️ Not enough free USD balance to trade.")
+                quote_asset, quote_available = pick_quote_balance(free_balances)
+                if quote_available < 1:
+                    print(f"⚠️ Not enough free {quote_asset} balance to trade.")
                     time.sleep(10)
                     continue
             except Exception as e:
@@ -1111,16 +1205,16 @@ def run_bot():
                 time.sleep(10)
                 continue
 
-            candidates = scan_top_cryptos()
+            candidates = scan_top_cryptos(quote_asset=quote_asset)
             if not candidates:
                 print("⚠️ No valid pairs found.")
                 time.sleep(10)
                 continue
 
-            total_allocatable = usd_available * 0.95
+            total_allocatable = quote_available * 0.95
             allocations = allocate_trade_sizes(candidates, total_allocatable)
             print(
-                f"💰 Total USD: ${usd_available:.2f}, Allocatable: ${total_allocatable:.2f}, "
+                f"💰 Total {quote_asset}: {quote_available:.2f}, Allocatable: {total_allocatable:.2f}, "
                 f"Candidates: {[(c['symbol'], round(allocations.get(c['symbol'], 0), 2)) for c in candidates]}"
             )
 
@@ -1129,9 +1223,9 @@ def run_bot():
 
             for candidate in candidates:
                 symbol = candidate['symbol']
-                usd_budget = allocations.get(symbol, 0)
-                if usd_budget <= 0:
-                    print(f"⚠️ No USD allocation for {symbol}; skipping.")
+                quote_budget = allocations.get(symbol, 0)
+                if quote_budget <= 0:
+                    print(f"⚠️ No {quote_asset} allocation for {symbol}; skipping.")
                     continue
                 if symbol in open_positions:
                     print(f"⏸️ Already holding {symbol}; skipping new entry.")
@@ -1147,7 +1241,7 @@ def run_bot():
                     print(f"⚠️ Unable to determine price for {symbol}; skipping.")
                     continue
 
-                amount = round(usd_budget / price, 6)
+                amount = quote_budget / price
                 if amount <= 0:
                     print(f"⚠️ Computed trade amount invalid for {symbol}; skipping.")
                     continue
@@ -1160,7 +1254,7 @@ def run_bot():
                     entry_reason = "Scanner entry: " + "; ".join(reason_components)
 
                 print(
-                    f"✅ Executing candidate {symbol}: USD ${usd_budget:.2f}, amount {amount}, "
+                    f"✅ Executing candidate {symbol}: {quote_asset} {quote_budget:.2f}, amount {amount:.6f}, "
                     f"spread {spread_text}"
                 )
                 execute_trade(symbol, "buy", amount, reason=entry_reason)
