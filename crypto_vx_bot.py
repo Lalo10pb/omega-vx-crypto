@@ -35,6 +35,9 @@ ohlcv_cache: Dict[Tuple[str, str, int], Dict[str, object]] = {}
 regime_last_check: float = 0.0
 regime_last_result: Tuple[bool, str] = (True, "init")
 
+orderbook_cache: Dict[Tuple[str, float], Dict[str, object]] = {}
+listing_age_cache: Dict[str, Dict[str, float]] = {}
+
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 5))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
@@ -64,6 +67,14 @@ REGIME_EMA_SLOW = int(os.getenv("REGIME_EMA_SLOW", 50))
 REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", 180))
 REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", -1.0))
 REGIME_CACHE_SECONDS = int(os.getenv("REGIME_CACHE_SECONDS", 300))
+ORDERBOOK_CACHE_TTL_SECONDS = int(os.getenv("ORDERBOOK_CACHE_TTL_SECONDS", 30))
+DEPTH_ORDERBOOK_LIMIT = int(os.getenv("DEPTH_ORDERBOOK_LIMIT", 50))
+DEPTH_BAND_PERCENT = float(os.getenv("DEPTH_BAND_PERCENT", 0.5))
+MIN_DEPTH_IMBALANCE = float(os.getenv("MIN_DEPTH_IMBALANCE", 1.1))
+MIN_DEPTH_NOTIONAL_USD = float(os.getenv("MIN_DEPTH_NOTIONAL_USD", 1500.0))
+LISTING_AGE_LOOKBACK_DAYS = int(os.getenv("LISTING_AGE_LOOKBACK_DAYS", 365))
+LISTING_AGE_CACHE_SECONDS = int(os.getenv("LISTING_AGE_CACHE_SECONDS", 3600))
+NEW_LISTING_BOOST_DAYS = int(os.getenv("NEW_LISTING_BOOST_DAYS", 30))
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -424,6 +435,83 @@ def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int, ttl: Optional[in
     data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     ohlcv_cache[key] = {'ts': now, 'data': data}
     return data
+
+
+def fetch_orderbook_metrics(symbol: str, depth_percent: float = DEPTH_BAND_PERCENT) -> Dict[str, float]:
+    key = (symbol, depth_percent)
+    now = time.time()
+    cached = orderbook_cache.get(key)
+    if cached and (now - cached.get('timestamp', 0.0)) < ORDERBOOK_CACHE_TTL_SECONDS:
+        return cached
+
+    try:
+        orderbook = exchange.fetch_order_book(symbol, limit=DEPTH_ORDERBOOK_LIMIT)
+    except Exception as err:
+        print(f"⚠️ Failed to fetch order book for {symbol}: {err}")
+        return {}
+
+    bids = orderbook.get('bids') or []
+    asks = orderbook.get('asks') or []
+    if not bids or not asks:
+        return {}
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    if not isinstance(best_bid, (int, float)) or not isinstance(best_ask, (int, float)) or best_bid <= 0 or best_ask <= 0:
+        return {}
+
+    mid_price = (best_bid + best_ask) / 2
+    spread_pct = ((best_ask - best_bid) / mid_price) * 100 if mid_price > 0 else None
+    band_ratio = max(depth_percent, 0.01) / 100
+    lower_bound = mid_price * (1 - band_ratio)
+    upper_bound = mid_price * (1 + band_ratio)
+
+    bid_volume = sum(amount for price, amount in bids if isinstance(price, (int, float)) and price >= lower_bound)
+    ask_volume = sum(amount for price, amount in asks if isinstance(price, (int, float)) and price <= upper_bound)
+    depth_ratio = (bid_volume / ask_volume) if ask_volume and ask_volume > 0 else None
+
+    result = {
+        'timestamp': now,
+        'mid_price': mid_price,
+        'spread_pct': spread_pct,
+        'bid_volume_band': bid_volume,
+        'ask_volume_band': ask_volume,
+        'depth_ratio': depth_ratio,
+    }
+    orderbook_cache[key] = result
+    return result
+
+
+def get_listing_age_days(symbol: str) -> Optional[float]:
+    now = time.time()
+    cached = listing_age_cache.get(symbol)
+    if cached and (now - cached.get('timestamp', 0.0)) < LISTING_AGE_CACHE_SECONDS:
+        return cached.get('age_days')
+
+    try:
+        daily = fetch_ohlcv_cached(
+            symbol,
+            timeframe='1d',
+            limit=LISTING_AGE_LOOKBACK_DAYS,
+            ttl=LISTING_AGE_CACHE_SECONDS,
+        )
+    except Exception as err:
+        print(f"⚠️ Failed to estimate listing age for {symbol}: {err}")
+        return None
+
+    if not daily:
+        return None
+
+    first_timestamp = daily[0][0]
+    if not isinstance(first_timestamp, (int, float)):
+        return None
+
+    age_days = max((now - (first_timestamp / 1000)) / 86400, 0.0)
+    listing_age_cache[symbol] = {
+        'timestamp': now,
+        'age_days': age_days,
+    }
+    return age_days
 
 
 def reconcile_quote_alias(balance_key: str) -> str:
@@ -880,6 +968,9 @@ def log_scanner_snapshot(records: List[Dict]) -> None:
                     "score",
                     "quote_volume",
                     "spread_pct",
+                    "depth_ratio",
+                    "depth_bid_notional",
+                    "depth_ask_notional",
                     "atr_pct",
                     "rsi_1h",
                     "adx_1h",
@@ -888,6 +979,7 @@ def log_scanner_snapshot(records: List[Dict]) -> None:
                     "roc_pct",
                     "multi_timeframe_alignment",
                     "fresh_signal_age",
+                    "listing_age_days",
                     "reasons"
                 ])
             for record in records:
@@ -898,6 +990,9 @@ def log_scanner_snapshot(records: List[Dict]) -> None:
                     record.get('score'),
                     indicators.get('quote_volume'),
                     indicators.get('spread_pct'),
+                    indicators.get('depth_ratio'),
+                    indicators.get('depth_bid_notional'),
+                    indicators.get('depth_ask_notional'),
                     indicators.get('atr_pct'),
                     indicators.get('rsi_1h'),
                     indicators.get('adx_1h'),
@@ -906,6 +1001,7 @@ def log_scanner_snapshot(records: List[Dict]) -> None:
                     indicators.get('roc_pct'),
                     indicators.get('timeframe_alignment'),
                     indicators.get('fresh_signal_age'),
+                    indicators.get('listing_age_days'),
                     " | ".join(record.get('reasons', []))
                 ])
     except Exception as err:
@@ -973,6 +1069,23 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             mid_price = (bid + ask) / 2
             spread_pct = ((ask - bid) / mid_price) * 100 if mid_price > 0 else None
             if spread_pct is None or spread_pct > MAX_SPREAD_PERCENT:
+                continue
+
+            depth_metrics = fetch_orderbook_metrics(symbol)
+            if not depth_metrics:
+                continue
+            depth_spread_pct = depth_metrics.get('spread_pct')
+            if isinstance(depth_spread_pct, (int, float)) and depth_spread_pct > MAX_SPREAD_PERCENT:
+                continue
+            depth_ratio = depth_metrics.get('depth_ratio')
+            if depth_ratio is None or depth_ratio < MIN_DEPTH_IMBALANCE:
+                continue
+            depth_mid_price = depth_metrics.get('mid_price') or mid_price
+            bid_band_volume = float(depth_metrics.get('bid_volume_band') or 0.0)
+            ask_band_volume = float(depth_metrics.get('ask_volume_band') or 0.0)
+            bid_band_notional = bid_band_volume * depth_mid_price
+            ask_band_notional = ask_band_volume * depth_mid_price
+            if bid_band_notional < MIN_DEPTH_NOTIONAL_USD or ask_band_notional < MIN_DEPTH_NOTIONAL_USD:
                 continue
 
             try:
@@ -1066,6 +1179,11 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             if _trend_ok(ohlcv_1d):
                 timeframe_alignment_flags.append('1d')
 
+            listing_age_days = get_listing_age_days(symbol)
+            is_new_listing = (
+                listing_age_days is not None and listing_age_days <= NEW_LISTING_BOOST_DAYS
+            )
+
             score = 0
             reasons: List[str] = []
 
@@ -1093,6 +1211,14 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             if timeframe_alignment_flags:
                 score += len(timeframe_alignment_flags)
                 reasons.append("Multi-timeframe uptrend: " + ", ".join(timeframe_alignment_flags))
+            if depth_ratio and depth_ratio >= MIN_DEPTH_IMBALANCE:
+                score += 1
+                reasons.append(
+                    f"Order-book bids {depth_ratio:.2f}x asks inside {DEPTH_BAND_PERCENT:.1f}%"
+                )
+            if is_new_listing:
+                score += 1
+                reasons.append(f"Fresh Kraken listing (~{listing_age_days:.1f}d)")
 
             if score < 4:
                 continue
@@ -1111,8 +1237,13 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                     "atr_pct": atr_pct,
                     "quote_volume": quote_volume,
                     "spread_pct": spread_pct,
+                    "depth_ratio": depth_ratio,
+                    "depth_bid_notional": bid_band_notional,
+                    "depth_ask_notional": ask_band_notional,
+                    "depth_band_percent": DEPTH_BAND_PERCENT,
                     "fresh_signal_age": fresh_signal_age,
                     "timeframe_alignment": ",".join(timeframe_alignment_flags) if timeframe_alignment_flags else "",
+                    "listing_age_days": listing_age_days,
                 }
             }
             candidates.append(candidate)
