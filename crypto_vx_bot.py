@@ -5,6 +5,9 @@ import time
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import csv
+import os
 
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 print(f"📦 Loading environment from: {env_path}")
@@ -46,7 +49,8 @@ MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", 250_000))
 MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", 0.35))  # expressed in percent
 MAX_ATR_PERCENT = float(os.getenv("MAX_ATR_PERCENT", 0.07))
 FRESH_SIGNAL_LOOKBACK = int(os.getenv("FRESH_SIGNAL_LOOKBACK", 3))
-SCANNER_LOG_PATH = os.getenv("SCANNER_LOG_PATH", "scanner_evaluations.csv")
+SCANNER_LOG_PATH = os.getenv("SCANNER_LOG_PATH", "scanner_evaluation_log.csv")
+last_telegram_notify = datetime.utcnow() - timedelta(hours=12)  # Avoid spamming alerts
 MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", 900))
 OHLCV_CACHE_TTL_SECONDS = int(os.getenv("OHLCV_CACHE_TTL_SECONDS", 90))
 MULTI_TF_CACHE_TTL_SECONDS = int(os.getenv("MULTI_TF_CACHE_TTL_SECONDS", 300))
@@ -75,6 +79,11 @@ MIN_DEPTH_NOTIONAL_USD = float(os.getenv("MIN_DEPTH_NOTIONAL_USD", 1500.0))
 LISTING_AGE_LOOKBACK_DAYS = int(os.getenv("LISTING_AGE_LOOKBACK_DAYS", 365))
 LISTING_AGE_CACHE_SECONDS = int(os.getenv("LISTING_AGE_CACHE_SECONDS", 3600))
 NEW_LISTING_BOOST_DAYS = int(os.getenv("NEW_LISTING_BOOST_DAYS", 30))
+RESTRICTED_SYMBOLS = {
+    s.strip().upper()
+    for s in os.getenv("RESTRICTED_SYMBOLS", "EUR/USD,EUR/USDT,EUR/USDC").split(",")
+    if s.strip()
+}
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -547,6 +556,28 @@ def normalize_order_values(symbol: str, price: float, amount: float) -> Tuple[fl
     return precise_price, precise_amount
 
 
+def fetch_market_minimums(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """Return Kraken's minimum notional (cost) and amount for the given pair."""
+    get_markets()
+    try:
+        market = exchange.market(symbol)
+    except Exception as err:
+        print(f"⚠️ Failed to load market limits for {symbol}: {err}")
+        return None, None
+
+    limits = (market or {}).get('limits') or {}
+    amount_limits = limits.get('amount') or {}
+    cost_limits = limits.get('cost') or {}
+
+    def _cast(value: object) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return _cast(cost_limits.get('min')), _cast(amount_limits.get('min'))
+
+
 def current_total_exposure() -> float:
     exposure = 0.0
     for info in open_positions_data.values():
@@ -778,13 +809,24 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 send_telegram_alert(message)
                 return
 
+        # --- Begin retry block for buy logic ---
         if side == "buy":
-            order = exchange.create_limit_buy_order(symbol, amount, limit_price)
+            try:
+                order = exchange.create_order(symbol, "limit", "buy", amount, limit_price)
+            except Exception as e:
+                print(f"⚠️ Limit order failed, retrying with market order: {e}")
+                try:
+                    order = exchange.create_order(symbol, "market", "buy", amount)
+                except Exception as e2:
+                    print(f"❌ Market order also failed: {e2}")
+                    send_telegram_alert(f"❌ Trade failed for {symbol}. Limit and market both failed.")
+                    return None
         elif side == "sell":
             order = exchange.create_limit_sell_order(symbol, amount, limit_price)
         else:
             send_telegram_alert(f"❌ Invalid trade side: {side}")
             return
+        # --- End retry block ---
 
         print(
             f"📍LIMIT {side.upper()} for {symbol} @ {limit_price:.8f} "
@@ -1040,6 +1082,8 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
         restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
 
         for symbol, market in markets.items():
+            if symbol.upper() in RESTRICTED_SYMBOLS:
+                continue
             market_quote = (market or {}).get('quote')
             if market_quote:
                 if str(market_quote).upper() != quote_asset:
@@ -1248,6 +1292,36 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             }
             candidates.append(candidate)
 
+            # --- Append scanner evaluation log ---
+            # Use variables: symbol, last_price, rsi_1h, ema9, ema21, quote_volume, adx_1h, macd_hist_slope, roc_pct, passed_filters
+            passed_filters = score >= 4
+            ema_fast = ema9
+            ema_slow = ema21
+            price = last_price
+            rsi = rsi_1h
+            volume = quote_volume
+            adx = adx_1h if adx_1h is not None else 0.0
+            macd = macd_hist_slope if macd_hist_slope is not None else 0.0
+            roc = roc_pct if roc_pct is not None else 0.0
+            try:
+                with open(SCANNER_LOG_PATH, "a", newline="") as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow([
+                        datetime.utcnow().isoformat(),
+                        symbol,
+                        f"{price:.4f}",
+                        f"{rsi:.2f}",
+                        f"{ema_fast:.2f}",
+                        f"{ema_slow:.2f}",
+                        f"{volume:.2f}",
+                        f"{adx:.2f}",
+                        f"{macd:.2f}",
+                        f"{roc:.2f}",
+                        "YES" if passed_filters else "NO"
+                    ])
+            except Exception as log_err:
+                print(f"⚠️ Error writing scanner evaluation log: {log_err}")
+
         if not candidates:
             return []
 
@@ -1395,6 +1469,12 @@ def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
         )
     else:
         condition = "EMA stack" if ema_fast <= ema_slow else "ROC"
+        # Custom regime defensive log and alert
+        print(f"🛡️ Standing down: Regime defensive: EMA stack check failed (EMA21={ema_fast:.2f}, EMA55={ema_slow:.2f}, ROC={roc_value:.2f}%)")
+        global last_telegram_notify
+        if datetime.utcnow() - last_telegram_notify > timedelta(hours=3):
+            send_telegram_alert(f"⚠️ Omega-Crypto standing down: Weak trend regime (EMA21={ema_fast:.2f}, EMA55={ema_slow:.2f}, ROC={roc_value:.2f}%).")
+            last_telegram_notify = datetime.utcnow()
         reason = (
             f"Regime defensive: {condition} check failed "
             f"(EMA{REGIME_EMA_FAST}={ema_fast:.2f}, EMA{REGIME_EMA_SLOW}={ema_slow:.2f}, ROC={roc_value:.2f}%)"
@@ -1477,6 +1557,9 @@ def run_bot():
 
             for candidate in candidates:
                 symbol = candidate['symbol']
+                if symbol.upper() in RESTRICTED_SYMBOLS:
+                    print(f"🚫 {symbol} entry blocked: symbol restricted.")
+                    continue
                 quote_budget = allocations.get(symbol, 0)
                 if quote_budget <= 0:
                     print(f"⚠️ No {quote_asset} allocation for {symbol}; skipping.")
@@ -1516,6 +1599,21 @@ def run_bot():
                 amount = quote_budget / price
                 if amount <= 0:
                     print(f"⚠️ Computed trade amount invalid for {symbol}; skipping.")
+                    continue
+
+                min_cost, min_amount = fetch_market_minimums(symbol)
+                if min_cost and quote_budget < min_cost:
+                    print(
+                        f"🚫 {symbol} entry blocked: budget ${quote_budget:.2f} below Kraken minimum "
+                        f"${min_cost:.2f}."
+                    )
+                    continue
+                if min_amount and amount < min_amount:
+                    required_notional = min_amount * price
+                    print(
+                        f"🚫 {symbol} entry blocked: amount {amount:.6f} < min {min_amount:.6f} "
+                        f"(~${required_notional:.2f})."
+                    )
                     continue
 
                 spread_value = metrics.get('spread_pct')
