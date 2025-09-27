@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import csv
 import os
 
@@ -50,7 +50,10 @@ MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", 0.35))  # expressed i
 MAX_ATR_PERCENT = float(os.getenv("MAX_ATR_PERCENT", 0.07))
 FRESH_SIGNAL_LOOKBACK = int(os.getenv("FRESH_SIGNAL_LOOKBACK", 3))
 SCANNER_LOG_PATH = os.getenv("SCANNER_LOG_PATH", "scanner_evaluation_log.csv")
-last_telegram_notify = datetime.utcnow() - timedelta(hours=12)  # Avoid spamming alerts
+SCANNER_SNAPSHOT_PATH = os.getenv("SCANNER_SNAPSHOT_PATH", "scanner_snapshot_log.csv")
+last_telegram_notify = datetime.now(timezone.utc) - timedelta(hours=12)  # Avoid spamming alerts
+last_loop_start_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+last_regime_metrics: Dict[str, float] = {}
 MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", 900))
 OHLCV_CACHE_TTL_SECONDS = int(os.getenv("OHLCV_CACHE_TTL_SECONDS", 90))
 MULTI_TF_CACHE_TTL_SECONDS = int(os.getenv("MULTI_TF_CACHE_TTL_SECONDS", 300))
@@ -69,7 +72,7 @@ REGIME_TIMEFRAME = os.getenv("REGIME_TIMEFRAME", "4h")
 REGIME_EMA_FAST = int(os.getenv("REGIME_EMA_FAST", 21))
 REGIME_EMA_SLOW = int(os.getenv("REGIME_EMA_SLOW", 50))
 REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", 180))
-REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", -1.0))
+REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", 0.0))
 REGIME_CACHE_SECONDS = int(os.getenv("REGIME_CACHE_SECONDS", 300))
 ORDERBOOK_CACHE_TTL_SECONDS = int(os.getenv("ORDERBOOK_CACHE_TTL_SECONDS", 30))
 DEPTH_ORDERBOOK_LIMIT = int(os.getenv("DEPTH_ORDERBOOK_LIMIT", 50))
@@ -828,6 +831,17 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             return
         # --- End retry block ---
 
+        placed_price = order.get('price') if isinstance(order, dict) else None
+        if not placed_price and side == "buy":
+            placed_price = limit_price if limit_price else reference_price
+        elif not placed_price:
+            placed_price = limit_price
+        try:
+            placed_price_float = float(placed_price) if placed_price else float(reference_price)
+        except (TypeError, ValueError):
+            placed_price_float = float(reference_price)
+        print(f"✅ Trade placed: {symbol} at {placed_price_float:.4f} for qty {amount}", flush=True)
+
         print(
             f"📍LIMIT {side.upper()} for {symbol} @ {limit_price:.8f} "
             f"(amount: {amount:.6f}) placed; waiting for fill..."
@@ -1000,8 +1014,8 @@ def log_scanner_snapshot(records: List[Dict]) -> None:
         return
     try:
         timestamp = datetime.now().isoformat()
-        file_exists = os.path.exists(SCANNER_LOG_PATH)
-        with open(SCANNER_LOG_PATH, mode='a', newline='') as log_file:
+        file_exists = os.path.exists(SCANNER_SNAPSHOT_PATH)
+        with open(SCANNER_SNAPSHOT_PATH, mode='a', newline='') as log_file:
             writer = csv.writer(log_file)
             if not file_exists:
                 writer.writerow([
@@ -1081,7 +1095,9 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
 
         restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
 
-        for symbol, market in markets.items():
+        tickers = list(markets.items())
+        print(f"🔍 Starting scan: {len(tickers)} tokens to evaluate...", flush=True)
+        for symbol, market in tickers:
             if symbol.upper() in RESTRICTED_SYMBOLS:
                 continue
             market_quote = (market or {}).get('quote')
@@ -1264,7 +1280,17 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                 score += 1
                 reasons.append(f"Fresh Kraken listing (~{listing_age_days:.1f}d)")
 
+            # Compute extra diagnostics for logging
+            ema_slope = (ema9 - ema21) / ema21 if ema21 else 0.0
+            volatility = atr_pct or 0.0
+            print(
+                f"🔬 {symbol} — Score: {score} | EMA Slope: {ema_slope:.4f} | "
+                f"RSI: {rsi_1h:.2f} | Volatility: {volatility:.4f}",
+                flush=True
+            )
+
             if score < 4:
+                print(f"⏭️ Skipped {symbol}: Did not pass filters (score={score})", flush=True)
                 continue
 
             candidate = {
@@ -1293,8 +1319,7 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             candidates.append(candidate)
 
             # --- Append scanner evaluation log ---
-            # Use variables: symbol, last_price, rsi_1h, ema9, ema21, quote_volume, adx_1h, macd_hist_slope, roc_pct, passed_filters
-            passed_filters = score >= 4
+            # Use variables: symbol, last_price, rsi_1h, ema9, ema21, quote_volume, adx_1h, macd_hist_slope, roc_pct
             ema_fast = ema9
             ema_slow = ema21
             price = last_price
@@ -1304,10 +1329,24 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             macd = macd_hist_slope if macd_hist_slope is not None else 0.0
             roc = roc_pct if roc_pct is not None else 0.0
             try:
+                log_exists = os.path.exists(SCANNER_LOG_PATH)
                 with open(SCANNER_LOG_PATH, "a", newline="") as csvfile:
                     writer = csv.writer(csvfile)
+                    if not log_exists:
+                        writer.writerow([
+                            "timestamp",
+                            "symbol",
+                            "price",
+                            "rsi",
+                            "ema_fast",
+                            "ema_slow",
+                            "quote_volume",
+                            "adx",
+                            "macd_slope",
+                            "roc_pct"
+                        ])
                     writer.writerow([
-                        datetime.utcnow().isoformat(),
+                        datetime.now(timezone.utc).isoformat(),
                         symbol,
                         f"{price:.4f}",
                         f"{rsi:.2f}",
@@ -1316,8 +1355,7 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                         f"{volume:.2f}",
                         f"{adx:.2f}",
                         f"{macd:.2f}",
-                        f"{roc:.2f}",
-                        "YES" if passed_filters else "NO"
+                        f"{roc:.2f}"
                     ])
             except Exception as log_err:
                 print(f"⚠️ Error writing scanner evaluation log: {log_err}")
@@ -1414,7 +1452,7 @@ def validate_entry_conditions(symbol: str) -> Tuple[bool, str, Dict[str, float]]
 
 
 def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
-    global regime_last_check, regime_last_result
+    global regime_last_check, regime_last_result, last_regime_metrics, last_loop_start_str
     now = time.time()
     if not force and (now - regime_last_check) < REGIME_CACHE_SECONDS and regime_last_result is not None:
         return regime_last_result
@@ -1461,20 +1499,34 @@ def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
     if roc_value is None:
         roc_value = 0.0
 
+    last_regime_metrics = {
+        'ema_fast': float(ema_fast),
+        'ema_slow': float(ema_slow),
+        'roc': float(roc_value),
+    }
+
     bullish = ema_fast > ema_slow and roc_value >= REGIME_MIN_ROC
     if bullish:
         reason = (
             f"EMA{REGIME_EMA_FAST}>{REGIME_EMA_SLOW} ({ema_fast:.2f}>{ema_slow:.2f}) "
             f"and ROC {roc_value:.2f}%"
-        )
+    )
     else:
         condition = "EMA stack" if ema_fast <= ema_slow else "ROC"
         # Custom regime defensive log and alert
-        print(f"🛡️ Standing down: Regime defensive: EMA stack check failed (EMA21={ema_fast:.2f}, EMA55={ema_slow:.2f}, ROC={roc_value:.2f}%)")
+        loop_label = last_loop_start_str or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ema_21 = float(ema_fast)
+        ema_55 = float(ema_slow)
+        roc = float(roc_value)
+        print(
+            f"🛡️ Regime defensive at {loop_label}: EMA21={ema_21:.2f}, "
+            f"EMA55={ema_55:.2f}, ROC={roc:.2f}%",
+            flush=True
+        )
         global last_telegram_notify
-        if datetime.utcnow() - last_telegram_notify > timedelta(hours=3):
+        if datetime.now(timezone.utc) - last_telegram_notify > timedelta(hours=3):
             send_telegram_alert(f"⚠️ Omega-Crypto standing down: Weak trend regime (EMA21={ema_fast:.2f}, EMA55={ema_slow:.2f}, ROC={roc_value:.2f}%).")
-            last_telegram_notify = datetime.utcnow()
+            last_telegram_notify = datetime.now(timezone.utc)
         reason = (
             f"Regime defensive: {condition} check failed "
             f"(EMA{REGIME_EMA_FAST}={ema_fast:.2f}, EMA{REGIME_EMA_SLOW}={ema_slow:.2f}, ROC={roc_value:.2f}%)"
@@ -1516,11 +1568,28 @@ def run_bot():
     print("🔁 Starting OMEGA-VX-CRYPTO bot loop...")
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
+        print("🌀 Cycle started: scanning market and monitoring positions...")
+        loop_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        global last_loop_start_str
+        last_loop_start_str = loop_start
+        print(f"🔁 Loop started at {loop_start} UTC", flush=True)
         try:
             monitor_positions()
             regime_ok, regime_reason = evaluate_market_regime()
             if not regime_ok:
-                print(f"🛡️ Standing down: {regime_reason}")
+                metrics = last_regime_metrics or {}
+                ema_21 = metrics.get('ema_fast')
+                ema_55 = metrics.get('ema_slow')
+                roc = metrics.get('roc')
+                if all(isinstance(val, (int, float)) for val in (ema_21, ema_55, roc)):
+                    print(
+                        f"🛡️ Regime defensive at {loop_start}: EMA21={ema_21:.2f}, "
+                        f"EMA55={ema_55:.2f}, ROC={roc:.2f}%",
+                        flush=True
+                    )
+                else:
+                    print(f"🛡️ Regime defensive at {loop_start}: {regime_reason}", flush=True)
+                print("📉 Market conditions not favorable — skipping trade evaluation this cycle.")
                 time.sleep(30)
                 continue
 
@@ -1637,6 +1706,10 @@ def run_bot():
                 summarize_weekly_pnl()
             print("📌 Current open positions:", open_positions)
             time.sleep(30)
+            print(
+                f"🔁 Loop ended at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n",
+                flush=True
+            )
         except Exception as e:
             send_telegram_alert(f"🚨 Bot error: {str(e)}")
             time.sleep(60)
