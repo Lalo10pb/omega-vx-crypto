@@ -96,6 +96,7 @@ RESTRICTED_SYMBOLS = {
 TRADE_LOG_PATH = "crypto_trade_log.csv"
 TRADE_LOG_PATH_BACKUP = "crypto_trade_log_backup.csv"
 PORTFOLIO_LOG_PATH = "crypto_portfolio_log.csv"
+TRADE_FEATURE_LOG_PATH = os.getenv("TRADE_FEATURE_LOG_PATH", "trade_feature_log.csv")
 
 # === Helper Functions for EMA and RSI ===
 def calculate_ema(prices, period=20):
@@ -640,6 +641,77 @@ def log_trade(symbol, side, amount, price, reason):
         f"📒 LOGGED TRADE: {side.upper()} {symbol} | Amount: {amount} @ {price:.4f} ({reason})"
     )
 
+
+def log_trade_features(
+    symbol: str,
+    score: Optional[float],
+    indicators: Optional[Dict[str, object]],
+    reasons: Optional[List[str]],
+    filled_amount: Optional[float],
+    executed_price: Optional[float],
+    *,
+    actual_notional: Optional[float] = None,
+    effective_stop_pct: Optional[float] = None,
+) -> None:
+    indicators = indicators or {}
+    timestamp = datetime.now(timezone.utc).isoformat()
+    try:
+        file_exists = os.path.exists(TRADE_FEATURE_LOG_PATH)
+        with open(TRADE_FEATURE_LOG_PATH, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow([
+                    "Timestamp",
+                    "Symbol",
+                    "Score",
+                    "FilledAmount",
+                    "ExecutedPrice",
+                    "ActualNotional",
+                    "EffectiveStopPct",
+                    "QuoteVolume",
+                    "SpreadPct",
+                    "RSI1h",
+                    "ATRPct",
+                    "VolumeRatio",
+                    "ADX1h",
+                    "MACDHistSlope",
+                    "ROCPct",
+                    "DepthRatio",
+                    "DepthBidNotional",
+                    "DepthAskNotional",
+                    "TimeframeAlignment",
+                    "FreshSignalAge",
+                    "ListingAgeDays",
+                    "Reasons",
+                ])
+            row = [
+                timestamp,
+                symbol,
+                score,
+                filled_amount,
+                executed_price,
+                actual_notional,
+                effective_stop_pct,
+                indicators.get('quote_volume') or indicators.get('quoteVolume') or indicators.get('volUsd24h'),
+                indicators.get('spread_pct'),
+                indicators.get('rsi_1h') or indicators.get('rsi'),
+                indicators.get('atr_pct'),
+                indicators.get('volume_ratio'),
+                indicators.get('adx_1h'),
+                indicators.get('macd_hist_slope'),
+                indicators.get('roc_pct'),
+                indicators.get('depth_ratio'),
+                indicators.get('depth_bid_notional'),
+                indicators.get('depth_ask_notional'),
+                indicators.get('timeframe_alignment'),
+                indicators.get('fresh_signal_age'),
+                indicators.get('listing_age_days'),
+                " | ".join(reasons or [])
+            ]
+            writer.writerow(row)
+    except Exception as err:
+        print(f"⚠️ Failed to log trade features: {err}")
+
 def log_portfolio_snapshot():
     try:
         usd = 0
@@ -694,31 +766,31 @@ def log_portfolio_snapshot():
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
-def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed") -> bool:
+def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed") -> Optional[Dict[str, float]]:
     now = time.time()
     if side == "buy":
         if symbol in open_positions:
             reason = f"⛔ Trade rejected: {symbol} is already in open_positions."
             print(reason)
             send_telegram_alert(reason)
-            return False
+            return None
         if now - last_buy_time[symbol] < COOLDOWN_SECONDS:
             wait_time = int(COOLDOWN_SECONDS - (now - last_buy_time[symbol])) // 60
             reason = f"⏳ Trade rejected: cooldown active for {symbol} ({wait_time} min remaining)."
             print(reason)
             send_telegram_alert(reason)
-            return False
+            return None
         if len(open_positions) >= MAX_OPEN_POSITIONS:
             reason = f"🚫 Max open positions reached ({MAX_OPEN_POSITIONS}); skipping {symbol} buy."
             print(reason)
             send_telegram_alert(reason)
-            return False
+            return None
     if side == "buy" and now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
         wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
         reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
         print(reason)
         send_telegram_alert(reason)
-        return False
+        return None
 
     try:
         print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
@@ -726,14 +798,14 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Invalid trade amount for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
         ticker = exchange.fetch_ticker(symbol)
         reference_price = extract_valid_price(ticker)
         if reference_price is None:
             message = f"⚠️ No valid price data available for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         try:
             order_book = exchange.fetch_order_book(symbol, limit=10)
@@ -741,7 +813,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Failed to fetch order book for {symbol}: {book_err}"
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         side_levels = order_book.get('asks' if side == "buy" else 'bids') or []
         side_levels = [level for level in side_levels if isinstance(level, list) and len(level) >= 2]
@@ -749,14 +821,14 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Order book empty for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         book_price = side_levels[0][0]
         if not isinstance(book_price, (int, float)) or book_price <= 0:
             message = f"⚠️ Order book price invalid for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         available_volume = sum(level[1] for level in side_levels if isinstance(level[1], (int, float)))
         if side == "sell":
@@ -767,7 +839,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 message = f"⚠️ No position size available for {symbol}; skipping sell."
                 print(message)
                 send_telegram_alert(message)
-                return False
+                return None
 
         fallback_price = price if isinstance(price, (int, float)) and price > 0 else reference_price
         buffer = max(LIMIT_PRICE_BUFFER, 0.0)
@@ -786,12 +858,12 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Computed limit price invalid for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
         if amount <= 0:
             message = f"⚠️ Order size rounded to zero for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         if available_volume < amount:
             message = (
@@ -800,7 +872,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             )
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         if side == "buy":
             projected_exposure = current_total_exposure() + (fallback_price * amount)
@@ -811,7 +883,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 )
                 print(message)
                 send_telegram_alert(message)
-                return False
+                return None
 
         # --- Begin retry block for buy logic ---
         if side == "buy":
@@ -824,12 +896,12 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 except Exception as e2:
                     print(f"❌ Market order also failed: {e2}")
                     send_telegram_alert(f"❌ Trade failed for {symbol}. Limit and market both failed.")
-                    return False
+                    return None
         elif side == "sell":
             order = exchange.create_limit_sell_order(symbol, amount, limit_price)
         else:
             send_telegram_alert(f"❌ Invalid trade side: {side}")
-            return False
+            return None
         # --- End retry block ---
 
         placed_price = order.get('price') if isinstance(order, dict) else None
@@ -855,7 +927,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⏹️ {symbol} {side} order not filled (status: {status})."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         executed_price = final_order.get('average') or final_order.get('price') or fallback_price
         if executed_price is None or executed_price <= 0:
@@ -865,7 +937,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ {symbol} execution price unavailable; skipping trade log."
             print(message)
             send_telegram_alert(message)
-            return False
+            return None
 
         executed_price = float(executed_price)
         if filled_amount < amount:
@@ -898,11 +970,14 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
         log_trade(symbol, side, filled_amount, executed_price, reason)
         print(f"✅ {side.upper()} order filled for {symbol}: {filled_amount} @ ${executed_price:.4f} (status: {status})")
         save_bot_state()
-        return True
+        return {
+            "filled_amount": filled_amount,
+            "executed_price": executed_price,
+        }
     except Exception as e:
         send_telegram_alert(f"❌ Trade execution failed: {e}")
         print(f"❌ Trade execution failed: {e}")
-        return False
+        return None
 
 # === Monitor & Auto-Close Open Positions ===
 def monitor_positions():
@@ -1695,14 +1770,32 @@ def run_bot():
                 if reason_components:
                     entry_reason = "Scanner entry: " + "; ".join(reason_components)
 
+                combined_indicators = dict(candidate.get('indicators') or {})
+                for key, value in (metrics or {}).items():
+                    if value is not None:
+                        combined_indicators[key] = value
+
                 print(
                     f"✅ Executing candidate {symbol}: {quote_asset} {quote_budget:.2f}, amount {amount:.6f}, "
                     f"spread {spread_text}, stop risk {effective_stop_pct * 100:.2f}%"
                 )
-                trade_success = execute_trade(symbol, "buy", amount, reason=entry_reason)
-                if trade_success:
-                    trade_risk_used = quote_budget * effective_stop_pct
+                trade_result = execute_trade(symbol, "buy", amount, reason=entry_reason)
+                if trade_result:
+                    executed_amount = float(trade_result.get('filled_amount') or 0.0)
+                    executed_price = float(trade_result.get('executed_price') or 0.0)
+                    actual_notional = executed_price * executed_amount if executed_amount and executed_price else quote_budget
+                    trade_risk_used = actual_notional * effective_stop_pct
                     risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
+                    log_trade_features(
+                        symbol,
+                        candidate.get('score'),
+                        combined_indicators,
+                        reason_components,
+                        executed_amount,
+                        executed_price,
+                        actual_notional=actual_notional,
+                        effective_stop_pct=effective_stop_pct * 100,
+                    )
                     break
 
             log_portfolio_snapshot()
