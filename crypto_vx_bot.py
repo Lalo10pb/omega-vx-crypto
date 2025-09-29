@@ -51,6 +51,7 @@ MAX_ATR_PERCENT = float(os.getenv("MAX_ATR_PERCENT", 0.07))
 FRESH_SIGNAL_LOOKBACK = int(os.getenv("FRESH_SIGNAL_LOOKBACK", 3))
 SCANNER_LOG_PATH = os.getenv("SCANNER_LOG_PATH", "scanner_evaluation_log.csv")
 SCANNER_SNAPSHOT_PATH = os.getenv("SCANNER_SNAPSHOT_PATH", "scanner_snapshot_log.csv")
+SCANNER_MAX_CANDIDATES = max(int(os.getenv("SCANNER_MAX_CANDIDATES", 1)), 1)
 last_telegram_notify = datetime.now(timezone.utc) - timedelta(hours=12)  # Avoid spamming alerts
 last_loop_start_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 last_regime_metrics: Dict[str, float] = {}
@@ -693,31 +694,31 @@ def log_portfolio_snapshot():
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
-def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed"):
+def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed") -> bool:
     now = time.time()
     if side == "buy":
         if symbol in open_positions:
             reason = f"⛔ Trade rejected: {symbol} is already in open_positions."
             print(reason)
             send_telegram_alert(reason)
-            return
+            return False
         if now - last_buy_time[symbol] < COOLDOWN_SECONDS:
             wait_time = int(COOLDOWN_SECONDS - (now - last_buy_time[symbol])) // 60
             reason = f"⏳ Trade rejected: cooldown active for {symbol} ({wait_time} min remaining)."
             print(reason)
             send_telegram_alert(reason)
-            return
+            return False
         if len(open_positions) >= MAX_OPEN_POSITIONS:
             reason = f"🚫 Max open positions reached ({MAX_OPEN_POSITIONS}); skipping {symbol} buy."
             print(reason)
             send_telegram_alert(reason)
-            return
+            return False
     if side == "buy" and now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
         wait_min = int((TRADE_COOLDOWN_SECONDS - (now - last_trade_time[symbol])) / 60)
         reason = f"⏳ GLOBAL COOLDOWN: {symbol} trade blocked ({wait_min} min left)."
         print(reason)
         send_telegram_alert(reason)
-        return
+        return False
 
     try:
         print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
@@ -725,14 +726,14 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Invalid trade amount for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
         ticker = exchange.fetch_ticker(symbol)
         reference_price = extract_valid_price(ticker)
         if reference_price is None:
             message = f"⚠️ No valid price data available for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         try:
             order_book = exchange.fetch_order_book(symbol, limit=10)
@@ -740,7 +741,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Failed to fetch order book for {symbol}: {book_err}"
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         side_levels = order_book.get('asks' if side == "buy" else 'bids') or []
         side_levels = [level for level in side_levels if isinstance(level, list) and len(level) >= 2]
@@ -748,14 +749,14 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Order book empty for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         book_price = side_levels[0][0]
         if not isinstance(book_price, (int, float)) or book_price <= 0:
             message = f"⚠️ Order book price invalid for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         available_volume = sum(level[1] for level in side_levels if isinstance(level[1], (int, float)))
         if side == "sell":
@@ -766,7 +767,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 message = f"⚠️ No position size available for {symbol}; skipping sell."
                 print(message)
                 send_telegram_alert(message)
-                return
+                return False
 
         fallback_price = price if isinstance(price, (int, float)) and price > 0 else reference_price
         buffer = max(LIMIT_PRICE_BUFFER, 0.0)
@@ -785,12 +786,12 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ Computed limit price invalid for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
         if amount <= 0:
             message = f"⚠️ Order size rounded to zero for {symbol}; skipping {side} order."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         if available_volume < amount:
             message = (
@@ -799,7 +800,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             )
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         if side == "buy":
             projected_exposure = current_total_exposure() + (fallback_price * amount)
@@ -810,7 +811,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 )
                 print(message)
                 send_telegram_alert(message)
-                return
+                return False
 
         # --- Begin retry block for buy logic ---
         if side == "buy":
@@ -823,12 +824,12 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 except Exception as e2:
                     print(f"❌ Market order also failed: {e2}")
                     send_telegram_alert(f"❌ Trade failed for {symbol}. Limit and market both failed.")
-                    return None
+                    return False
         elif side == "sell":
             order = exchange.create_limit_sell_order(symbol, amount, limit_price)
         else:
             send_telegram_alert(f"❌ Invalid trade side: {side}")
-            return
+            return False
         # --- End retry block ---
 
         placed_price = order.get('price') if isinstance(order, dict) else None
@@ -854,7 +855,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⏹️ {symbol} {side} order not filled (status: {status})."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         executed_price = final_order.get('average') or final_order.get('price') or fallback_price
         if executed_price is None or executed_price <= 0:
@@ -864,7 +865,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             message = f"⚠️ {symbol} execution price unavailable; skipping trade log."
             print(message)
             send_telegram_alert(message)
-            return
+            return False
 
         executed_price = float(executed_price)
         if filled_amount < amount:
@@ -897,9 +898,11 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
         log_trade(symbol, side, filled_amount, executed_price, reason)
         print(f"✅ {side.upper()} order filled for {symbol}: {filled_amount} @ ${executed_price:.4f} (status: {status})")
         save_bot_state()
+        return True
     except Exception as e:
         send_telegram_alert(f"❌ Trade execution failed: {e}")
         print(f"❌ Trade execution failed: {e}")
+        return False
 
 # === Monitor & Auto-Close Open Positions ===
 def monitor_positions():
@@ -1607,7 +1610,7 @@ def run_bot():
                 time.sleep(10)
                 continue
 
-            candidates = scan_top_cryptos(quote_asset=quote_asset)
+            candidates = scan_top_cryptos(limit=SCANNER_MAX_CANDIDATES, quote_asset=quote_asset)
             if not candidates:
                 print("⚠️ No valid pairs found.")
                 time.sleep(10)
@@ -1696,9 +1699,11 @@ def run_bot():
                     f"✅ Executing candidate {symbol}: {quote_asset} {quote_budget:.2f}, amount {amount:.6f}, "
                     f"spread {spread_text}, stop risk {effective_stop_pct * 100:.2f}%"
                 )
-                execute_trade(symbol, "buy", amount, reason=entry_reason)
-                trade_risk_used = quote_budget * effective_stop_pct
-                risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
+                trade_success = execute_trade(symbol, "buy", amount, reason=entry_reason)
+                if trade_success:
+                    trade_risk_used = quote_budget * effective_stop_pct
+                    risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
+                    break
 
             log_portfolio_snapshot()
             now_dt = datetime.now()
