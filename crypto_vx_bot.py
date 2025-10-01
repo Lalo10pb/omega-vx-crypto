@@ -1175,8 +1175,13 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
 
         tickers = list(markets.items())
         print(f"🔍 Starting scan: {len(tickers)} tokens to evaluate...", flush=True)
+
+        def log_skip(symbol_name: str, reason: str) -> None:
+            print(f"🚫 Skipping {symbol_name} — {reason}", flush=True)
+
         for symbol, market in tickers:
             if symbol.upper() in RESTRICTED_SYMBOLS:
+                log_skip(symbol, "restricted symbol")
                 continue
             market_quote = (market or {}).get('quote')
             if market_quote:
@@ -1185,38 +1190,53 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             elif not symbol.endswith(symbol_suffix):
                 continue
             if any(keyword in symbol for keyword in restricted_keywords):
+                log_skip(symbol, "symbol flagged by restricted keywords")
                 continue
             if market and not market.get('active', True):
+                log_skip(symbol, "market not active")
                 continue
 
             try:
                 ticker = exchange.fetch_ticker(symbol)
-            except Exception:
+            except Exception as fetch_err:
+                log_skip(symbol, f"ticker fetch failed ({fetch_err})")
                 continue
 
             quote_volume = extract_quote_volume(ticker)
             if quote_volume is None or quote_volume < MIN_QUOTE_VOLUME_24H:
+                vol_text = "unavailable" if quote_volume is None else f"{quote_volume:.2f} < min {MIN_QUOTE_VOLUME_24H:.2f}"
+                log_skip(symbol, f"failed volume filter ({vol_text})")
                 continue
 
             bid = ticker.get('bid')
             ask = ticker.get('ask')
             if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)):
+                log_skip(symbol, "bid/ask not numeric")
                 continue
             if bid <= 0 or ask <= 0 or ask <= bid:
+                log_skip(symbol, "invalid bid/ask spread")
                 continue
             mid_price = (bid + ask) / 2
             spread_pct = ((ask - bid) / mid_price) * 100 if mid_price > 0 else None
             if spread_pct is None or spread_pct > MAX_SPREAD_PERCENT:
+                if spread_pct is None:
+                    log_skip(symbol, "spread unavailable")
+                else:
+                    log_skip(symbol, f"failed spread filter ({spread_pct:.2f}% > {MAX_SPREAD_PERCENT:.2f}%)")
                 continue
 
             depth_metrics = fetch_orderbook_metrics(symbol)
             if not depth_metrics:
+                log_skip(symbol, "order book metrics unavailable")
                 continue
             depth_spread_pct = depth_metrics.get('spread_pct')
             if isinstance(depth_spread_pct, (int, float)) and depth_spread_pct > MAX_SPREAD_PERCENT:
+                log_skip(symbol, f"order book spread high ({depth_spread_pct:.2f}% > {MAX_SPREAD_PERCENT:.2f}%)")
                 continue
             depth_ratio = depth_metrics.get('depth_ratio')
             if depth_ratio is None or depth_ratio < MIN_DEPTH_IMBALANCE:
+                ratio_text = "unavailable" if depth_ratio is None else f"{depth_ratio:.2f} < {MIN_DEPTH_IMBALANCE:.2f}"
+                log_skip(symbol, f"failed depth imbalance ({ratio_text})")
                 continue
             depth_mid_price = depth_metrics.get('mid_price') or mid_price
             bid_band_volume = float(depth_metrics.get('bid_volume_band') or 0.0)
@@ -1224,13 +1244,19 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             bid_band_notional = bid_band_volume * depth_mid_price
             ask_band_notional = ask_band_volume * depth_mid_price
             if bid_band_notional < MIN_DEPTH_NOTIONAL_USD or ask_band_notional < MIN_DEPTH_NOTIONAL_USD:
+                log_skip(
+                    symbol,
+                    f"order book notional too low (bid ${bid_band_notional:.2f}, ask ${ask_band_notional:.2f})"
+                )
                 continue
 
             try:
                 ohlcv_1h = fetch_ohlcv_cached(symbol, timeframe='1h', limit=200)
-            except Exception:
+            except Exception as ohlcv_err:
+                log_skip(symbol, f"1h OHLCV fetch failed ({ohlcv_err})")
                 continue
             if not ohlcv_1h or len(ohlcv_1h) < 100:
+                log_skip(symbol, "insufficient 1h OHLCV history")
                 continue
 
             closes_1h = [c[4] for c in ohlcv_1h]
@@ -1239,15 +1265,18 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             volumes_1h = [c[5] for c in ohlcv_1h]
 
             if not closes_1h or closes_1h[-1] is None:
+                log_skip(symbol, "invalid close data")
                 continue
             last_price = float(closes_1h[-1])
             if last_price <= 0:
+                log_skip(symbol, "last price non-positive")
                 continue
 
             ema9_series = calculate_ema_series(closes_1h, 9)
             ema21_series = calculate_ema_series(closes_1h, 21)
             ema50_series = calculate_ema_series(closes_1h, 50)
             if not ema9_series or not ema21_series or not ema50_series:
+                log_skip(symbol, "EMA series unavailable")
                 continue
             ema9 = ema9_series[-1]
             ema21 = ema21_series[-1]
@@ -1255,6 +1284,7 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
 
             rsi_values = calculate_rsi(closes_1h)
             if not rsi_values:
+                log_skip(symbol, "RSI calculation failed")
                 continue
             rsi_1h = rsi_values[-1]
 
@@ -1264,6 +1294,7 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
             atr_value = compute_atr(highs_1h, lows_1h, closes_1h)
             atr_pct = (atr_value / last_price) if atr_value else None
             if atr_pct and atr_pct > MAX_ATR_PERCENT:
+                log_skip(symbol, f"failed volatility filter (ATR {atr_pct*100:.2f}% > {MAX_ATR_PERCENT*100:.2f}% max)")
                 continue
 
             avg_vol_20 = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else None
@@ -1367,7 +1398,7 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                 flush=True
             )
 
-            if score < 4:
+            if score < 2:
                 print(f"⏭️ Skipped {symbol}: Did not pass filters (score={score})", flush=True)
                 continue
 
@@ -1437,6 +1468,20 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                     ])
             except Exception as log_err:
                 print(f"⚠️ Error writing scanner evaluation log: {log_err}")
+
+        # Debug: Show top 5 scoring cryptos
+        if candidates:
+            top_scores = sorted(
+                (
+                    (candidate.get('symbol'), candidate.get('score'))
+                    for candidate in candidates
+                    if isinstance(candidate, dict) and candidate.get('score') is not None
+                ),
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]
+            for symbol, score in top_scores:
+                print(f"🔍 Top candidate: {symbol} | Score: {score}")
 
         if not candidates:
             return []
