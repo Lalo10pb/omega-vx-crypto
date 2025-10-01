@@ -464,8 +464,24 @@ def fetch_orderbook_metrics(symbol: str, depth_percent: float = DEPTH_BAND_PERCE
         print(f"⚠️ Failed to fetch order book for {symbol}: {err}")
         return {}
 
-    bids = orderbook.get('bids') or []
-    asks = orderbook.get('asks') or []
+    raw_bids = orderbook.get('bids') or []
+    raw_asks = orderbook.get('asks') or []
+
+    def _sanitize_levels(levels: List) -> List[Tuple[float, float]]:
+        cleaned: List[Tuple[float, float]] = []
+        for level in levels:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            price = level[0]
+            amount = level[1]
+            if not isinstance(price, (int, float)) or not isinstance(amount, (int, float)):
+                continue
+            cleaned.append((float(price), float(amount)))
+        return cleaned
+
+    bids = _sanitize_levels(raw_bids)
+    asks = _sanitize_levels(raw_asks)
+
     if not bids or not asks:
         return {}
 
@@ -480,8 +496,8 @@ def fetch_orderbook_metrics(symbol: str, depth_percent: float = DEPTH_BAND_PERCE
     lower_bound = mid_price * (1 - band_ratio)
     upper_bound = mid_price * (1 + band_ratio)
 
-    bid_volume = sum(amount for price, amount in bids if isinstance(price, (int, float)) and price >= lower_bound)
-    ask_volume = sum(amount for price, amount in asks if isinstance(price, (int, float)) and price <= upper_bound)
+    bid_volume = sum(amount for price, amount in bids if price >= lower_bound)
+    ask_volume = sum(amount for price, amount in asks if price <= upper_bound)
     depth_ratio = (bid_volume / ask_volume) if ask_volume and ask_volume > 0 else None
 
     result = {
