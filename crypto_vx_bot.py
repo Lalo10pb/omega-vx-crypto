@@ -101,6 +101,16 @@ TRADE_LOG_PATH = "crypto_trade_log.csv"
 TRADE_LOG_PATH_BACKUP = "crypto_trade_log_backup.csv"
 PORTFOLIO_LOG_PATH = "crypto_portfolio_log.csv"
 TRADE_FEATURE_LOG_PATH = os.getenv("TRADE_FEATURE_LOG_PATH", "trade_feature_log.csv")
+LOGS_DIR = os.getenv("LOGS_DIR", "logs")
+EQUITY_LOG_PATH = os.path.join(LOGS_DIR, "equity_log.csv")
+
+
+def ensure_directory(path: str) -> None:
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+ensure_directory(LOGS_DIR)
 
 # === Helper Functions for EMA and RSI ===
 def calculate_ema(prices, period=20):
@@ -744,6 +754,15 @@ def log_portfolio_snapshot():
         except Exception as e:
             print("❌ Error fetching balance:", e)
         timestamp = datetime.now().isoformat()
+        portfolio_value = float(total) if isinstance(total, (int, float)) else 0.0
+
+        ensure_directory(os.path.dirname(EQUITY_LOG_PATH))
+        equity_log_exists = os.path.exists(EQUITY_LOG_PATH)
+        with open(EQUITY_LOG_PATH, mode='a', newline='') as equity_file:
+            equity_writer = csv.writer(equity_file)
+            if not equity_log_exists:
+                equity_writer.writerow(["timestamp", "cash_balance", "portfolio_value"])
+            equity_writer.writerow([timestamp, float(usd or 0.0), portfolio_value])
 
         # Log to local CSV
         with open(PORTFOLIO_LOG_PATH, mode='a', newline='') as file:
@@ -764,22 +783,46 @@ def log_portfolio_snapshot():
             send_telegram_alert(f"⚠️ Failed to log portfolio to sheet: {str(sheet_err)}")
 
         # --- Daily PnL summary logic ---
-        def summarize_daily_pnl(equity_log_file="logs/equity_log.csv"):
+        def summarize_daily_pnl(equity_log_file: str = EQUITY_LOG_PATH) -> str:
+            if not equity_log_file or not os.path.exists(equity_log_file):
+                return "📈 Daily P&L: awaiting first equity snapshot."
             try:
                 df = pd.read_csv(equity_log_file)
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                today = datetime.now().date()
-                daily_logs = df[df["timestamp"].dt.date == today]
-                if len(daily_logs) >= 2:
-                    start_value = daily_logs.iloc[0]["portfolio_value"]
-                    end_value = daily_logs.iloc[-1]["portfolio_value"]
-                    change = end_value - start_value
-                    pct_change = (change / start_value) * 100
-                    return f"📈 Daily P&L: ${change:.2f} ({pct_change:.2f}%)"
-                else:
-                    return "📈 Daily P&L: Not enough data for summary yet."
             except Exception as e:
-                return f"⚠️ Error generating P&L summary: {e}"
+                return f"⚠️ Error loading equity log: {e}"
+
+            if df.empty or "timestamp" not in df.columns:
+                return "📈 Daily P&L: awaiting sufficient equity data."
+
+            try:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+            except Exception as parse_err:
+                return f"⚠️ Equity log timestamp parse error: {parse_err}"
+
+            today = datetime.now().date()
+            today_logs = df[df["timestamp"].dt.date == today]
+            if "portfolio_value" not in today_logs.columns:
+                return "📈 Daily P&L: equity log missing portfolio values."
+
+            today_logs = today_logs.dropna(subset=["portfolio_value"])
+            if len(today_logs) < 2:
+                return f"📈 Daily P&L: {len(today_logs)} snapshot(s); collecting more data."
+
+            start_value = float(today_logs.iloc[0]["portfolio_value"] or 0.0)
+            end_value = float(today_logs.iloc[-1]["portfolio_value"] or 0.0)
+            change = end_value - start_value
+            pct_change = (change / start_value * 100) if start_value else 0.0
+            high_value = float(today_logs["portfolio_value"].max())
+            low_value = float(today_logs["portfolio_value"].min())
+            samples = len(today_logs)
+
+            return (
+                "📈 Daily P&L Update\n"
+                f"Start: ${start_value:.2f} → Current: ${end_value:.2f}\n"
+                f"Δ ${change:+.2f} ({pct_change:+.2f}%) | High/Low: ${high_value:.2f} / ${low_value:.2f}\n"
+                f"Snapshots logged: {samples}"
+            )
+
         send_telegram_alert(summarize_daily_pnl())
 
         print(f"💾 Snapshot: USD=${usd:.2f}, Total=${total:.2f}")
@@ -1922,8 +1965,16 @@ def run_bot():
 
 def summarize_weekly_pnl():
     try:
+        if not os.path.exists(TRADE_LOG_PATH):
+            send_telegram_alert(
+                f"📆 Weekly PnL: trade log '{TRADE_LOG_PATH}' not found; no data to summarize."
+            )
+            return
         df = pd.read_csv(TRADE_LOG_PATH)
         df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        if df.empty:
+            send_telegram_alert("📆 Weekly PnL: trade log is empty.")
+            return
         df['Week'] = df['Timestamp'].dt.to_period('W').astype(str)
 
         df['SignedAmount'] = df.apply(lambda row: row['Amount'] * row['Price'] if row['Side'] == 'sell' else -row['Amount'] * row['Price'], axis=1)
