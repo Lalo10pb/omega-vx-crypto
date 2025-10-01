@@ -1703,7 +1703,15 @@ def run_bot():
             send_telegram_alert(f"🧠 Scanner picks: {summary}")
 
             for candidate in candidates:
-                symbol = candidate['symbol']
+                symbol = candidate[0] if isinstance(candidate, (list, tuple)) else candidate.get('symbol')
+                if isinstance(candidate, (list, tuple)):
+                    # If candidate is a tuple/list, try to build a dict-like interface for compatibility
+                    candidate_dict = {}
+                    if len(candidate) > 0:
+                        candidate_dict['symbol'] = candidate[0]
+                    if len(candidate) > 1:
+                        candidate_dict['score'] = candidate[1]
+                    candidate = candidate_dict
                 if symbol.upper() in RESTRICTED_SYMBOLS:
                     print(f"🚫 {symbol} entry blocked: symbol restricted.")
                     continue
@@ -1723,7 +1731,7 @@ def run_bot():
                     print(f"🚫 {symbol} entry blocked: {rejection_reason}")
                     continue
 
-                price = metrics.get('last_price') or candidate.get('indicators', {}).get('last_price')
+                price = metrics.get('last_price') or candidate.get('indicators', {}).get('last_price') if isinstance(candidate, dict) else None
                 if not price or price <= 0:
                     print(f"⚠️ Unable to determine price for {symbol}; skipping.")
                     continue
@@ -1766,11 +1774,11 @@ def run_bot():
                 spread_value = metrics.get('spread_pct')
                 spread_text = f"{spread_value:.3f}%" if isinstance(spread_value, (int, float)) else "N/A"
                 entry_reason = "Scanner entry"
-                reason_components = candidate.get('reasons')
+                reason_components = candidate.get('reasons') if isinstance(candidate, dict) else None
                 if reason_components:
                     entry_reason = "Scanner entry: " + "; ".join(reason_components)
 
-                combined_indicators = dict(candidate.get('indicators') or {})
+                combined_indicators = dict(candidate.get('indicators') or {}) if isinstance(candidate, dict) else {}
                 for key, value in (metrics or {}).items():
                     if value is not None:
                         combined_indicators[key] = value
@@ -1788,7 +1796,7 @@ def run_bot():
                     risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
                     log_trade_features(
                         symbol,
-                        candidate.get('score'),
+                        candidate.get('score') if isinstance(candidate, dict) else None,
                         combined_indicators,
                         reason_components,
                         executed_amount,
