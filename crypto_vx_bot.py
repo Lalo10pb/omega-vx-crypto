@@ -46,6 +46,10 @@ MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
 LIMIT_PRICE_BUFFER = float(os.getenv("LIMIT_PRICE_BUFFER", 0.001))
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", 250_000))
+_MIN_QUOTE_VOLUME_FALLBACK = float(
+    os.getenv("MIN_QUOTE_VOLUME_FALLBACK", MIN_QUOTE_VOLUME_24H * 0.6)
+)
+MIN_QUOTE_VOLUME_FALLBACK = max(0.0, min(_MIN_QUOTE_VOLUME_FALLBACK, MIN_QUOTE_VOLUME_24H))
 MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", 0.35))  # expressed in percent
 MAX_ATR_PERCENT = float(os.getenv("MAX_ATR_PERCENT", 0.07))
 FRESH_SIGNAL_LOOKBACK = int(os.getenv("FRESH_SIGNAL_LOOKBACK", 3))
@@ -1179,13 +1183,30 @@ def extract_quote_volume(ticker: Dict) -> Optional[float]:
     return None
 
 
-def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[Dict[str, object]]:
+def scan_top_cryptos(
+    limit: int = 5,
+    quote_asset: Optional[str] = None,
+    min_volume: Optional[float] = None,
+    allow_fallback: bool = True,
+) -> List[Dict[str, object]]:
     try:
         quote_asset = (quote_asset or DEFAULT_QUOTE_ASSET).upper()
         print(f"🔍 Scanning {exchange_name.upper()} {quote_asset} markets with enhanced filters...")
         markets = get_markets()
         candidates: List[Dict[str, object]] = []
         symbol_suffix = f"/{quote_asset}"
+
+        volume_threshold = max(0.0, min_volume if min_volume is not None else MIN_QUOTE_VOLUME_24H)
+        fallback_volume = MIN_QUOTE_VOLUME_FALLBACK
+        if volume_threshold <= 0:
+            volume_threshold = 0.0
+        if fallback_volume <= 0 or fallback_volume >= volume_threshold:
+            fallback_volume = volume_threshold
+        if min_volume is not None and min_volume < MIN_QUOTE_VOLUME_24H:
+            print(
+                f"ℹ️ Using relaxed volume threshold {volume_threshold:,.0f} "
+                f"(default {MIN_QUOTE_VOLUME_24H:,.0f})."
+            )
 
         restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
 
@@ -1219,8 +1240,12 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                 continue
 
             quote_volume = extract_quote_volume(ticker)
-            if quote_volume is None or quote_volume < MIN_QUOTE_VOLUME_24H:
-                vol_text = "unavailable" if quote_volume is None else f"{quote_volume:.2f} < min {MIN_QUOTE_VOLUME_24H:.2f}"
+            if quote_volume is None or quote_volume < volume_threshold:
+                vol_text = (
+                    "unavailable"
+                    if quote_volume is None
+                    else f"{quote_volume:.2f} < min {volume_threshold:.2f}"
+                )
                 log_skip(symbol, f"failed volume filter ({vol_text})")
                 continue
 
@@ -1500,6 +1525,17 @@ def scan_top_cryptos(limit: int = 5, quote_asset: Optional[str] = None) -> List[
                 print(f"🔍 Top candidate: {symbol} | Score: {score}")
 
         if not candidates:
+            if allow_fallback and fallback_volume < volume_threshold:
+                print(
+                    f"ℹ️ No candidates found with volume ≥ {volume_threshold:,.0f}. "
+                    f"Retrying scan with relaxed threshold {fallback_volume:,.0f}."
+                )
+                return scan_top_cryptos(
+                    limit=limit,
+                    quote_asset=quote_asset,
+                    min_volume=fallback_volume,
+                    allow_fallback=False,
+                )
             return []
 
         candidates.sort(key=lambda item: (-(item.get('score') or 0), -(item.get('indicators', {}).get('quote_volume') or 0)))
