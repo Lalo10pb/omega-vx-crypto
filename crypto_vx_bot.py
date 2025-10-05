@@ -45,9 +45,9 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 5))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", 500.0))
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.json")
 LIMIT_PRICE_BUFFER = float(os.getenv("LIMIT_PRICE_BUFFER", 0.001))
-MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", 250_000))
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", 100_000))
 _MIN_QUOTE_VOLUME_FALLBACK = float(
-    os.getenv("MIN_QUOTE_VOLUME_FALLBACK", MIN_QUOTE_VOLUME_24H * 0.6)
+    os.getenv("MIN_QUOTE_VOLUME_FALLBACK", 60_000)
 )
 MIN_QUOTE_VOLUME_FALLBACK = max(0.0, min(_MIN_QUOTE_VOLUME_FALLBACK, MIN_QUOTE_VOLUME_24H))
 MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", 0.35))  # expressed in percent
@@ -59,6 +59,8 @@ SCANNER_MAX_CANDIDATES = max(int(os.getenv("SCANNER_MAX_CANDIDATES", 1)), 1)
 last_telegram_notify = datetime.now(timezone.utc) - timedelta(hours=12)  # Avoid spamming alerts
 last_loop_start_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 last_regime_metrics: Dict[str, float] = {}
+last_weekly_summary_date: Optional[str] = None
+last_portfolio_snapshot: float = 0.0
 MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", 900))
 OHLCV_CACHE_TTL_SECONDS = int(os.getenv("OHLCV_CACHE_TTL_SECONDS", 90))
 MULTI_TF_CACHE_TTL_SECONDS = int(os.getenv("MULTI_TF_CACHE_TTL_SECONDS", 300))
@@ -69,15 +71,15 @@ PREFERRED_QUOTES = [
 ]
 HARD_STOP_PERCENT = float(os.getenv("HARD_STOP_PERCENT", 3.0))
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", 0.02))
-ATR_TRAIL_MULTIPLIER = float(os.getenv("ATR_TRAIL_MULTIPLIER", 1.5))
+ATR_TRAIL_MULTIPLIER = float(os.getenv("ATR_TRAIL_MULTIPLIER", 2.0))
 ATR_TAKE_PROFIT_MULTIPLIER = float(os.getenv("ATR_TAKE_PROFIT_MULTIPLIER", 3.5))
-ATR_HARD_STOP_MULTIPLIER = float(os.getenv("ATR_HARD_STOP_MULTIPLIER", 2.5))
+ATR_HARD_STOP_MULTIPLIER = float(os.getenv("ATR_HARD_STOP_MULTIPLIER", 3.0))
 REGIME_SYMBOL = os.getenv("REGIME_SYMBOL", "BTC/USD")
 REGIME_TIMEFRAME = os.getenv("REGIME_TIMEFRAME", "4h")
 REGIME_EMA_FAST = int(os.getenv("REGIME_EMA_FAST", 21))
 REGIME_EMA_SLOW = int(os.getenv("REGIME_EMA_SLOW", 50))
 REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", 180))
-REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", 0.0))
+REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", 0.2))
 REGIME_CACHE_SECONDS = int(os.getenv("REGIME_CACHE_SECONDS", 300))
 ORDERBOOK_CACHE_TTL_SECONDS = int(os.getenv("ORDERBOOK_CACHE_TTL_SECONDS", 30))
 DEPTH_ORDERBOOK_LIMIT = int(os.getenv("DEPTH_ORDERBOOK_LIMIT", 50))
@@ -92,6 +94,7 @@ RESTRICTED_SYMBOLS = {
     for s in os.getenv("RESTRICTED_SYMBOLS", "EUR/USD,EUR/USDT,EUR/USDC").split(",")
     if s.strip()
 }
+PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS", 1800))
 
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
@@ -782,31 +785,37 @@ def log_portfolio_snapshot():
         except Exception as sheet_err:
             send_telegram_alert(f"⚠️ Failed to log portfolio to sheet: {str(sheet_err)}")
 
-        # --- Daily PnL summary logic ---
-        def summarize_daily_pnl(equity_log_file: str = EQUITY_LOG_PATH) -> str:
+        # --- Equity analytics & notifications ---
+        now_utc = datetime.now(timezone.utc)
+
+        def load_equity_dataframe(equity_log_file: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
             if not equity_log_file or not os.path.exists(equity_log_file):
-                return "📈 Daily P&L: awaiting first equity snapshot."
+                return None, "📈 Daily P&L: awaiting first equity snapshot."
             try:
                 df = pd.read_csv(equity_log_file)
-            except Exception as e:
-                return f"⚠️ Error loading equity log: {e}"
+            except Exception as err:
+                return None, f"⚠️ Error loading equity log: {err}"
 
-            if df.empty or "timestamp" not in df.columns:
-                return "📈 Daily P&L: awaiting sufficient equity data."
+            if df.empty or "timestamp" not in df.columns or "portfolio_value" not in df.columns:
+                return None, "📈 Daily P&L: awaiting sufficient equity data."
 
             try:
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors='coerce')
             except Exception as parse_err:
-                return f"⚠️ Equity log timestamp parse error: {parse_err}"
+                return None, f"⚠️ Equity log timestamp parse error: {parse_err}"
 
-            today = datetime.now().date()
-            today_logs = df[df["timestamp"].dt.date == today]
-            if "portfolio_value" not in today_logs.columns:
-                return "📈 Daily P&L: equity log missing portfolio values."
+            df = df.dropna(subset=["timestamp", "portfolio_value"])
+            if df.empty:
+                return None, "📈 Daily P&L: awaiting sufficient equity data."
 
-            today_logs = today_logs.dropna(subset=["portfolio_value"])
-            if len(today_logs) < 2:
-                return f"📈 Daily P&L: {len(today_logs)} snapshot(s); collecting more data."
+            df.sort_values("timestamp", inplace=True)
+            return df, None
+
+        def summarize_daily_pnl(df: pd.DataFrame, as_of: datetime) -> str:
+            today_logs = df[df["timestamp"].dt.date == as_of.date()]
+            samples = len(today_logs)
+            if samples < 2:
+                return f"📈 Daily P&L: {samples} snapshot(s); collecting more data."
 
             start_value = float(today_logs.iloc[0]["portfolio_value"] or 0.0)
             end_value = float(today_logs.iloc[-1]["portfolio_value"] or 0.0)
@@ -814,7 +823,6 @@ def log_portfolio_snapshot():
             pct_change = (change / start_value * 100) if start_value else 0.0
             high_value = float(today_logs["portfolio_value"].max())
             low_value = float(today_logs["portfolio_value"].min())
-            samples = len(today_logs)
 
             return (
                 "📈 Daily P&L Update\n"
@@ -823,7 +831,58 @@ def log_portfolio_snapshot():
                 f"Snapshots logged: {samples}"
             )
 
-        send_telegram_alert(summarize_daily_pnl())
+        def summarize_weekly_pnl(df: pd.DataFrame, as_of: datetime) -> Optional[str]:
+            week_start = as_of - timedelta(days=7)
+            week_logs = df[df["timestamp"] >= week_start]
+            samples = len(week_logs)
+            if samples < 2:
+                return None
+
+            start_value = float(week_logs.iloc[0]["portfolio_value"] or 0.0)
+            end_value = float(week_logs.iloc[-1]["portfolio_value"] or 0.0)
+            change = end_value - start_value
+            pct_change = (change / start_value * 100) if start_value else 0.0
+            high_value = float(week_logs["portfolio_value"].max())
+            low_value = float(week_logs["portfolio_value"].min())
+
+            return (
+                "🗓️ Weekly P&L Summary\n"
+                f"Period: {week_start.date()} → {as_of.date()}\n"
+                f"Start ${start_value:.2f} → End ${end_value:.2f}\n"
+                f"Δ ${change:+.2f} ({pct_change:+.2f}%) | High/Low: ${high_value:.2f} / ${low_value:.2f}\n"
+                f"Snapshots this week: {samples}"
+            )
+
+        equity_df, equity_status_message = load_equity_dataframe(EQUITY_LOG_PATH)
+        if equity_df is not None:
+            daily_message = summarize_daily_pnl(equity_df, now_utc)
+            weekly_message = summarize_weekly_pnl(equity_df, now_utc)
+        else:
+            daily_message = equity_status_message
+            weekly_message = None
+
+        # --- Unrealized P&L summary ---
+        unrealized = 0.0
+        try:
+            for sym, pos in open_positions_data.items():
+                ticker = exchange.fetch_ticker(sym)
+                last_price = ticker.get("last") or ticker.get("close") or 0
+                if isinstance(last_price, (int, float)):
+                    entry_price = pos.get("entry_price", 0)
+                    amount = pos.get("amount", 0)
+                    unrealized += (last_price - entry_price) * amount
+        except Exception as uerr:
+            print(f"⚠️ Unrealized P&L fetch error: {uerr}")
+
+        send_telegram_alert(f"💵 Unrealized P&L: ${unrealized:+.2f}")
+        if daily_message:
+            send_telegram_alert(daily_message)
+
+        global last_weekly_summary_date
+        if weekly_message and now_utc.weekday() == 6:  # Sunday summary to avoid noise mid-week
+            if last_weekly_summary_date != now_utc.date().isoformat():
+                send_telegram_alert(weekly_message)
+                last_weekly_summary_date = now_utc.date().isoformat()
 
         print(f"💾 Snapshot: USD=${usd:.2f}, Total=${total:.2f}")
     except Exception as e:
@@ -1783,6 +1842,7 @@ def allocate_trade_sizes(candidates: List[Dict[str, object]], total_allocatable:
 
 # === Main Bot Loop ===
 def run_bot():
+    global last_portfolio_snapshot
     print("🔁 Starting OMEGA-VX-CRYPTO bot loop...")
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
@@ -1808,7 +1868,7 @@ def run_bot():
                 else:
                     print(f"🛡️ Regime defensive at {loop_start}: {regime_reason}", flush=True)
                 print("📉 Market conditions not favorable — skipping trade evaluation this cycle.")
-                time.sleep(30)
+                time.sleep(300)
                 continue
 
             # Adaptive trade amount based on available quote balance
@@ -1931,114 +1991,42 @@ def run_bot():
                 if trade_result:
                     executed_amount = float(trade_result.get('filled_amount') or 0.0)
                     executed_price = float(trade_result.get('executed_price') or 0.0)
-                    actual_notional = executed_price * executed_amount if executed_amount and executed_price else quote_budget
-                    trade_risk_used = actual_notional * effective_stop_pct
-                    risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
-                    log_trade_features(
-                        symbol,
-                        candidate.get('score') if isinstance(candidate, dict) else None,
-                        combined_indicators,
-                        reason_components,
-                        executed_amount,
-                        executed_price,
-                        actual_notional=actual_notional,
-                        effective_stop_pct=effective_stop_pct * 100,
-                    )
-                    break
+                    if executed_amount > 0 and executed_price > 0:
+                        actual_notional = executed_price * executed_amount
+                        trade_risk_used = actual_notional * effective_stop_pct
+                        log_trade_features(
+                            symbol,
+                            candidate.get('score') if isinstance(candidate, dict) else None,
+                            combined_indicators,
+                            reason_components,
+                            executed_amount,
+                            executed_price,
+                            actual_notional=actual_notional,
+                            effective_stop_pct=effective_stop_pct,
+                        )
+                        risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
+                        print(
+                            f"🧮 Risk budget remaining: ${risk_budget_remaining:.2f} "
+                            f"(consumed ${trade_risk_used:.2f} at {effective_stop_pct * 100:.2f}% stop)"
+                        )
+                        if risk_budget_remaining <= 0:
+                            print("✅ Risk budget consumed for this cycle; halting additional entries.")
+                            break
+                    else:
+                        print("⚠️ Trade fill data incomplete; skipping feature log and risk update.")
 
-            log_portfolio_snapshot()
-            now_dt = datetime.now()
-            if now_dt.weekday() == 6 and now_dt.hour == 17 and now_dt.minute < 5:
-                summarize_weekly_pnl()
-            print("📌 Current open positions:", open_positions)
+            try:
+                now_ts = time.time()
+                if now_ts - last_portfolio_snapshot >= PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:
+                    log_portfolio_snapshot()
+                    last_portfolio_snapshot = now_ts
+            except Exception as snapshot_err:
+                print(f"⚠️ Portfolio snapshot logging failed: {snapshot_err}")
+
+            # At the end of the loop, sleep 30 seconds for normal bullish cycles
             time.sleep(30)
-            print(
-                f"🔁 Loop ended at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n",
-                flush=True
-            )
-        except Exception as e:
-            send_telegram_alert(f"🚨 Bot error: {str(e)}")
+        except Exception as cycle_err:
+            message = f"❌ Bot cycle error: {cycle_err}"
+            print(message)
+            send_telegram_alert(message)
             time.sleep(60)
-
-# === Daily PnL Summary ===
-# (functionality replaced with the new summarize_daily_pnl in log_portfolio_snapshot)
-
-def summarize_weekly_pnl():
-    try:
-        if not os.path.exists(TRADE_LOG_PATH):
-            send_telegram_alert(
-                f"📆 Weekly PnL: trade log '{TRADE_LOG_PATH}' not found; no data to summarize."
-            )
-            return
-        df = pd.read_csv(TRADE_LOG_PATH)
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        if df.empty:
-            send_telegram_alert("📆 Weekly PnL: trade log is empty.")
-            return
-        df['Week'] = df['Timestamp'].dt.to_period('W').astype(str)
-
-        df['SignedAmount'] = df.apply(lambda row: row['Amount'] * row['Price'] if row['Side'] == 'sell' else -row['Amount'] * row['Price'], axis=1)
-        summary = df.groupby('Week')['SignedAmount'].sum().reset_index()
-        summary.columns = ['Week', 'Net PnL']
-
-        lines = [f"{row['Week']}: ${row['Net PnL']:.2f}" for _, row in summary.iterrows()]
-        if lines:
-            send_telegram_alert("📆 WEEKLY PNL SUMMARY:\n" + "\n".join(lines))
-
-        # Log to Google Sheet tab: VX-C Weekly PnL
-        client = get_gspread_client()
-        sheet = None
-        if client:
-            try:
-                sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
-            except Exception as sheet_err:
-                send_telegram_alert(f"⚠️ Failed to access Google Sheet: {sheet_err}")
-
-        if sheet:
-            try:
-                try:
-                    weekly_tab = sheet.worksheet("VX-C Weekly PnL")
-                except Exception:
-                    weekly_tab = sheet.add_worksheet(title="VX-C Weekly PnL", rows="1000", cols="3")
-                    weekly_tab.append_row(["Week", "Net PnL", "Asset Type"])
-                for _, row in summary.iterrows():
-                    weekly_tab.append_row([row['Week'], round(row['Net PnL'], 2), "crypto"])
-            except Exception as sheet_err:
-                send_telegram_alert(f"⚠️ Failed to log VX-C Weekly PnL to sheet: {sheet_err}")
-
-        # Monthly PnL Summary
-        df['Month'] = df['Timestamp'].dt.to_period('M').astype(str)
-        monthly_summary = df.groupby('Month')['SignedAmount'].sum().reset_index()
-        monthly_summary.columns = ['Month', 'Net PnL']
-        lines_month = [f"{row['Month']}: ${row['Net PnL']:.2f}" for _, row in monthly_summary.iterrows()]
-        if lines_month:
-            send_telegram_alert("📅 MONTHLY PNL SUMMARY:\n" + "\n".join(lines_month))
-
-        # All-Time PnL Summary
-        total_pnl = df['SignedAmount'].sum()
-        send_telegram_alert(f"🧮 ALL-TIME PNL SUMMARY:\nNet PnL: ${total_pnl:.2f}")
-
-        # Log Monthly and All-Time to Google Sheet tab: VX-C Monthly PnL
-        try:
-            monthly_tab_name = "VX-C Monthly PnL"
-            if sheet:
-                try:
-                    monthly_tab = sheet.worksheet(monthly_tab_name)
-                except Exception:
-                    monthly_tab = sheet.add_worksheet(title=monthly_tab_name, rows="1000", cols="3")
-                    monthly_tab.append_row(["Month", "Net PnL", "Asset Type"])
-                for _, row in monthly_summary.iterrows():
-                    monthly_tab.append_row([row['Month'], round(row['Net PnL'], 2), "crypto"])
-                monthly_tab.append_row(["All Time", round(total_pnl, 2), "crypto"])
-        except Exception as sheet_err:
-            send_telegram_alert(f"⚠️ Failed to log VX-C Monthly PnL to sheet: {sheet_err}")
-    except Exception as e:
-        send_telegram_alert(f"⚠️ Failed to summarize weekly PnL: {str(e)}")
-
-if __name__ == "__main__":
-    try:
-        run_bot()
-    except KeyboardInterrupt:
-        print("🛑 Bot stopped manually.")
-    except Exception as e:
-        send_telegram_alert(f"🚨 Uncaught error in main loop: {str(e)}")
