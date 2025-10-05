@@ -2030,3 +2030,7 @@ def run_bot():
             print(message)
             send_telegram_alert(message)
             time.sleep(60)
+
+
+if __name__ == "__main__":
+    run_bot()
