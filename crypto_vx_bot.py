@@ -1896,6 +1896,7 @@ def run_bot():
             risk_budget_remaining = max(quote_available * RISK_PER_TRADE_PCT, 0.0)
             print(
                 f"💰 Total {quote_asset}: {quote_available:.2f}, Allocatable: {total_allocatable:.2f}, "
+                f"Risk Budget: {risk_budget_remaining:.2f}, "
                 f"Candidates: {[(c['symbol'], round(allocations.get(c['symbol'], 0), 2)) for c in candidates]}"
             )
 
@@ -1940,96 +1941,56 @@ def run_bot():
                 atr_stop_pct = None
                 if isinstance(atr_pct, (int, float)) and atr_pct > 0:
                     atr_stop_pct = ATR_HARD_STOP_MULTIPLIER * float(atr_pct)
-                effective_stop_pct = HARD_STOP_PERCENT / 100
-                if atr_stop_pct and atr_stop_pct > 0:
-                    effective_stop_pct = min(effective_stop_pct, atr_stop_pct)
-                effective_stop_pct = max(effective_stop_pct, 0.0001)
 
-                max_position_from_risk = risk_budget_remaining / effective_stop_pct
-                if max_position_from_risk <= 0:
-                    print("⚠️ No remaining risk capacity; stopping entries.")
+                trade_notional = min(quote_budget, risk_budget_remaining)
+                if trade_notional <= 0:
+                    print(f"⚠️ Risk budget allows no additional exposure for {symbol}; skipping.")
+                    continue
+
+                position_size = trade_notional / price
+                if position_size <= 0:
+                    print(f"⚠️ Computed zero position size for {symbol}; skipping.")
+                    continue
+
+                # Execute buy
+                trade_result = execute_trade(symbol, "buy", position_size, price, reason="Signal entry")
+                if not trade_result:
+                    continue
+
+                filled_amt = trade_result.get("filled_amount")
+                executed_price = trade_result.get("executed_price")
+
+                # Log trade features for analytics
+                log_trade_features(
+                    symbol=symbol,
+                    score=candidate.get("score"),
+                    indicators=candidate.get("indicators"),
+                    reasons=candidate.get("reasons"),
+                    filled_amount=filled_amt,
+                    executed_price=executed_price,
+                    actual_notional=(filled_amt or 0) * (executed_price or 0),
+                    effective_stop_pct=atr_stop_pct,
+                )
+
+                # Decrement risk budget after each trade
+                risk_budget_remaining -= trade_notional
+                if risk_budget_remaining <= 0:
+                    print("⚠️ Risk budget fully consumed.")
                     break
 
-                quote_budget = min(quote_budget, max_position_from_risk)
-                amount = quote_budget / price
-                if amount <= 0:
-                    print(f"⚠️ Computed trade amount invalid for {symbol}; skipping.")
-                    continue
+            # Periodic equity snapshot
+            global last_portfolio_snapshot
+            now_ts = time.time()
+            if now_ts - last_portfolio_snapshot > PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:
+                log_portfolio_snapshot()
+                last_portfolio_snapshot = now_ts
 
-                min_cost, min_amount = fetch_market_minimums(symbol)
-                if min_cost and quote_budget < min_cost:
-                    print(
-                        f"🚫 {symbol} entry blocked: budget ${quote_budget:.2f} below Kraken minimum "
-                        f"${min_cost:.2f}."
-                    )
-                    continue
-                if min_amount and amount < min_amount:
-                    required_notional = min_amount * price
-                    print(
-                        f"🚫 {symbol} entry blocked: amount {amount:.6f} < min {min_amount:.6f} "
-                        f"(~${required_notional:.2f})."
-                    )
-                    continue
+        except Exception as loop_err:
+            send_telegram_alert(f"⚠️ Main loop exception: {loop_err}")
+            print(f"⚠️ Main loop exception: {loop_err}")
 
-                spread_value = metrics.get('spread_pct')
-                spread_text = f"{spread_value:.3f}%" if isinstance(spread_value, (int, float)) else "N/A"
-                entry_reason = "Scanner entry"
-                reason_components = candidate.get('reasons') if isinstance(candidate, dict) else None
-                if reason_components:
-                    entry_reason = "Scanner entry: " + "; ".join(reason_components)
-
-                combined_indicators = dict(candidate.get('indicators') or {}) if isinstance(candidate, dict) else {}
-                for key, value in (metrics or {}).items():
-                    if value is not None:
-                        combined_indicators[key] = value
-
-                print(
-                    f"✅ Executing candidate {symbol}: {quote_asset} {quote_budget:.2f}, amount {amount:.6f}, "
-                    f"spread {spread_text}, stop risk {effective_stop_pct * 100:.2f}%"
-                )
-                trade_result = execute_trade(symbol, "buy", amount, reason=entry_reason)
-                if trade_result:
-                    executed_amount = float(trade_result.get('filled_amount') or 0.0)
-                    executed_price = float(trade_result.get('executed_price') or 0.0)
-                    if executed_amount > 0 and executed_price > 0:
-                        actual_notional = executed_price * executed_amount
-                        trade_risk_used = actual_notional * effective_stop_pct
-                        log_trade_features(
-                            symbol,
-                            candidate.get('score') if isinstance(candidate, dict) else None,
-                            combined_indicators,
-                            reason_components,
-                            executed_amount,
-                            executed_price,
-                            actual_notional=actual_notional,
-                            effective_stop_pct=effective_stop_pct,
-                        )
-                        risk_budget_remaining = max(risk_budget_remaining - trade_risk_used, 0.0)
-                        print(
-                            f"🧮 Risk budget remaining: ${risk_budget_remaining:.2f} "
-                            f"(consumed ${trade_risk_used:.2f} at {effective_stop_pct * 100:.2f}% stop)"
-                        )
-                        if risk_budget_remaining <= 0:
-                            print("✅ Risk budget consumed for this cycle; halting additional entries.")
-                            break
-                    else:
-                        print("⚠️ Trade fill data incomplete; skipping feature log and risk update.")
-
-            try:
-                now_ts = time.time()
-                if now_ts - last_portfolio_snapshot >= PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:
-                    log_portfolio_snapshot()
-                    last_portfolio_snapshot = now_ts
-            except Exception as snapshot_err:
-                print(f"⚠️ Portfolio snapshot logging failed: {snapshot_err}")
-
-            # At the end of the loop, sleep 30 seconds for normal bullish cycles
-            time.sleep(30)
-        except Exception as cycle_err:
-            message = f"❌ Bot cycle error: {cycle_err}"
-            print(message)
-            send_telegram_alert(message)
-            time.sleep(60)
+        print("🌙 Cycle complete. Sleeping 120s before next iteration...", flush=True)
+        time.sleep(120)
 
 
 if __name__ == "__main__":
