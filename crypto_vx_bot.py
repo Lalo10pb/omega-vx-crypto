@@ -1,13 +1,19 @@
 import ccxt
+import csv
 import json
 import os
 import time
 from collections import defaultdict
-from typing import Optional, Dict, List, Tuple
-from dotenv import load_dotenv
+from typing import Dict, List, Optional, Tuple
+
+import gspread
+import numpy as np
+import pandas as pd
+import requests
+from ccxt.base.errors import NetworkError, ExchangeError
 from datetime import datetime, timedelta, timezone
-import csv
-import os
+from dotenv import load_dotenv
+from oauth2client.service_account import ServiceAccountCredentials
 
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 print(f"📦 Loading environment from: {env_path}")
@@ -15,13 +21,12 @@ if load_dotenv(dotenv_path=env_path):
     print("🔑 Environment variables loaded from .env.")
 else:
     print("⚠️ .env file not found or could not be loaded; relying on existing environment.")
-import numpy as np
-import requests
-import csv
-from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import pandas as pd
+
+
+class BotConfig:
+    LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", 300))
+    POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 60))
+    ALLOW_MARKET_FALLBACK = os.getenv("ALLOW_MARKET_FALLBACK", "true").lower() == "true"
 
 print("🟢 OMEGA-VX-CRYPTO bot started.")
 open_positions = set()
@@ -751,9 +756,13 @@ def log_portfolio_snapshot():
         total = 0
         try:
             balance = exchange.fetch_balance()
-            print("💰 Kraken Balance Keys:", list(balance['total'].keys()))
-            usd = balance['total'].get('USD', 0)
-            total = sum(v for v in balance['total'].values() if isinstance(v, (int, float)))
+            balance_total = balance.get('total', {})
+            print("💰 Kraken Balance Keys:", list(balance_total.keys()))
+            usd = balance_total.get('ZUSD', balance_total.get('USD', 0))
+            total = sum(
+                v for v in balance_total.values()
+                if isinstance(v, (int, float))
+            )
         except Exception as e:
             print("❌ Error fetching balance:", e)
         timestamp = datetime.now().isoformat()
@@ -888,6 +897,7 @@ def log_portfolio_snapshot():
     except Exception as e:
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
+# === RISK MANAGEMENT & EXECUTION ===
 def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed") -> Optional[Dict[str, float]]:
     now = time.time()
     if side == "buy":
@@ -1012,6 +1022,12 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             try:
                 order = exchange.create_order(symbol, "limit", "buy", amount, limit_price)
             except Exception as e:
+                if not BotConfig.ALLOW_MARKET_FALLBACK:
+                    print(f"⚠️ Limit order failed for {symbol} and market fallback disabled: {e}")
+                    send_telegram_alert(
+                        f"⚠️ Limit order failed for {symbol}; skipping (market fallback disabled)."
+                    )
+                    return None
                 print(f"⚠️ Limit order failed, retrying with market order: {e}")
                 try:
                     order = exchange.create_order(symbol, "market", "buy", amount)
@@ -1096,12 +1112,16 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             "filled_amount": filled_amount,
             "executed_price": executed_price,
         }
+    except (NetworkError, ExchangeError) as e:
+        send_telegram_alert(f"⚠️ Exchange communication error: {type(e).__name__} - {e}")
+        print(f"⚠️ Exchange communication error during trade: {e}")
+        return None
     except Exception as e:
-        send_telegram_alert(f"❌ Trade execution failed: {e}")
+        send_telegram_alert(f"❌ Unexpected error: {e}")
         print(f"❌ Trade execution failed: {e}")
         return None
 
-# === Monitor & Auto-Close Open Positions ===
+# === POSITION MONITORING ===
 def monitor_positions():
     print("🔍 Monitoring open positions...")
     state_dirty = False
@@ -1208,7 +1228,7 @@ def monitor_positions():
     if state_dirty:
         save_bot_state()
 
-# === Improved Coin Scanner ===
+# === MARKET SCANNER ===
 def log_scanner_snapshot(records: List[Dict]) -> None:
     if not records:
         return
@@ -1840,7 +1860,7 @@ def allocate_trade_sizes(candidates: List[Dict[str, object]], total_allocatable:
         allocations[candidate['symbol']] = total_allocatable * (weight / weight_sum)
     return allocations
 
-# === Main Bot Loop ===
+# === MAIN LOOP ENTRY POINT ===
 def run_bot():
     global last_portfolio_snapshot
     print("🔁 Starting OMEGA-VX-CRYPTO bot loop...")
@@ -1868,7 +1888,7 @@ def run_bot():
                 else:
                     print(f"🛡️ Regime defensive at {loop_start}: {regime_reason}", flush=True)
                 print("📉 Market conditions not favorable — skipping trade evaluation this cycle.")
-                time.sleep(300)
+                time.sleep(BotConfig.LOOP_SLEEP_SECONDS)
                 continue
 
             # Adaptive trade amount based on available quote balance
@@ -1985,12 +2005,17 @@ def run_bot():
                 log_portfolio_snapshot()
                 last_portfolio_snapshot = now_ts
 
+        except (NetworkError, ExchangeError) as loop_err:
+            send_telegram_alert(
+                f"⚠️ Exchange communication error: {type(loop_err).__name__} - {loop_err}"
+            )
+            print(f"⚠️ Exchange communication error in main loop: {loop_err}")
         except Exception as loop_err:
             send_telegram_alert(f"⚠️ Main loop exception: {loop_err}")
             print(f"⚠️ Main loop exception: {loop_err}")
 
-        print("🌙 Cycle complete. Sleeping 120s before next iteration...", flush=True)
-        time.sleep(120)
+        print(f"🌙 Cycle complete. Sleeping {BotConfig.LOOP_SLEEP_SECONDS}s before next iteration...", flush=True)
+        time.sleep(BotConfig.LOOP_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
