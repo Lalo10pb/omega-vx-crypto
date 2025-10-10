@@ -4,6 +4,7 @@ import json
 import os
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import gspread
@@ -23,10 +24,27 @@ else:
     print("⚠️ .env file not found or could not be loaded; relying on existing environment.")
 
 
+@dataclass
 class BotConfig:
-    LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", 300))
-    POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 60))
-    ALLOW_MARKET_FALLBACK = os.getenv("ALLOW_MARKET_FALLBACK", "true").lower() == "true"
+    LOOP_SLEEP_SECONDS: int = int(os.getenv("LOOP_SLEEP_SECONDS", 300))
+    POSITION_CHECK_INTERVAL: int = int(os.getenv("POSITION_CHECK_INTERVAL", 60))
+    ALLOW_MARKET_FALLBACK: bool = os.getenv("ALLOW_MARKET_FALLBACK", "true").lower() == "true"
+    DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
+    ALLOW_TRADING: bool = os.getenv("ALLOW_TRADING", "true").lower() == "true"
+    BOT_LOG_LEVEL: str = os.getenv("BOT_LOG_LEVEL", "info")
+    BOT_LOG_JSON: bool = os.getenv("BOT_LOG_JSON", "false").lower() == "true"
+
+
+config = BotConfig()
+
+
+def log_event(level: str, source: str, message: str) -> None:
+    """Centralized event logger (console + Telegram)."""
+    entry = f"[{level.upper()}] [{source}] {message}"
+    print(entry)
+    if "error" in level.lower() or "warn" in level.lower():
+        send_telegram_alert(entry)
+
 
 print("🟢 OMEGA-VX-CRYPTO bot started.")
 open_positions = set()
@@ -898,7 +916,14 @@ def log_portfolio_snapshot():
         send_telegram_alert(f"⚠️ Failed to log portfolio snapshot: {str(e)}")
 
 # === RISK MANAGEMENT & EXECUTION ===
-def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade executed") -> Optional[Dict[str, float]]:
+def execute_trade(
+    symbol: str,
+    side: str,
+    amount: float,
+    limit_price: Optional[float] = None,
+    reason: str = "Live trade executed"
+) -> Optional[Dict[str, float]]:
+    """Unified trade executor with dry-run & safe fallback."""
     now = time.time()
     if side == "buy":
         if symbol in open_positions:
@@ -925,41 +950,37 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
         return None
 
     try:
-        print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
-        if amount is None or amount <= 0:
-            message = f"⚠️ Invalid trade amount for {symbol}; skipping {side} order."
-            print(message)
-            send_telegram_alert(message)
-            return None
         ticker = exchange.fetch_ticker(symbol)
         reference_price = extract_valid_price(ticker)
         if reference_price is None:
             message = f"⚠️ No valid price data available for {symbol}; skipping {side} order."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
+            return None
+
+        print(f"🛒 Placing {side.upper()} order for {symbol} on {exchange_name.upper()}...")
+        if amount is None or amount <= 0:
+            message = f"⚠️ Invalid trade amount for {symbol}; skipping {side} order."
+            log_event("warn", "TradeEngine", message)
             return None
 
         try:
             order_book = exchange.fetch_order_book(symbol, limit=10)
         except Exception as book_err:
             message = f"⚠️ Failed to fetch order book for {symbol}: {book_err}"
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         side_levels = order_book.get('asks' if side == "buy" else 'bids') or []
         side_levels = [level for level in side_levels if isinstance(level, list) and len(level) >= 2]
         if not side_levels:
             message = f"⚠️ Order book empty for {symbol}; skipping {side} order."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         book_price = side_levels[0][0]
         if not isinstance(book_price, (int, float)) or book_price <= 0:
             message = f"⚠️ Order book price invalid for {symbol}; skipping {side} order."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         available_volume = sum(level[1] for level in side_levels if isinstance(level[1], (int, float)))
@@ -969,11 +990,10 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             amount = min(amount, position_amount) if position_amount else amount
             if amount <= 0:
                 message = f"⚠️ No position size available for {symbol}; skipping sell."
-                print(message)
-                send_telegram_alert(message)
+                log_event("warn", "TradeEngine", message)
                 return None
 
-        fallback_price = price if isinstance(price, (int, float)) and price > 0 else reference_price
+        fallback_price = limit_price if isinstance(limit_price, (int, float)) and limit_price > 0 else reference_price
         buffer = max(LIMIT_PRICE_BUFFER, 0.0)
         if side == "buy":
             limit_price = book_price if buffer == 0 else book_price * (1 + buffer)
@@ -988,13 +1008,11 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
         amount = precise_amount
         if limit_price <= 0:
             message = f"⚠️ Computed limit price invalid for {symbol}; skipping {side} order."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
         if amount <= 0:
             message = f"⚠️ Order size rounded to zero for {symbol}; skipping {side} order."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         if available_volume < amount:
@@ -1002,8 +1020,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                 f"⚠️ Not enough liquidity to {side} {amount} {symbol}; "
                 f"available {available_volume:.4f}."
             )
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         if side == "buy":
@@ -1013,32 +1030,39 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
                     f"🚫 Exposure cap hit: projected {projected_exposure:.2f} exceeds {MAX_TOTAL_EXPOSURE_USD:.2f}; "
                     f"skipping {symbol} buy."
                 )
-                print(message)
-                send_telegram_alert(message)
+                log_event("warn", "TradeEngine", message)
                 return None
+
+        if config.DRY_RUN or not config.ALLOW_TRADING:
+            log_event(
+                "info",
+                "TradeEngine",
+                f"DRY-RUN: would execute {side.upper()} {symbol} @ {limit_price:.8f} for {amount:.6f}"
+            )
+            return {"status": "dry_run", "amount": amount, "limit_price": limit_price}
 
         # --- Begin retry block for buy logic ---
         if side == "buy":
             try:
                 order = exchange.create_order(symbol, "limit", "buy", amount, limit_price)
             except Exception as e:
-                if not BotConfig.ALLOW_MARKET_FALLBACK:
-                    print(f"⚠️ Limit order failed for {symbol} and market fallback disabled: {e}")
-                    send_telegram_alert(
-                        f"⚠️ Limit order failed for {symbol}; skipping (market fallback disabled)."
+                if not config.ALLOW_MARKET_FALLBACK:
+                    log_event(
+                        "warn",
+                        "TradeEngine",
+                        f"Limit order failed for {symbol} and market fallback disabled: {e}"
                     )
                     return None
-                print(f"⚠️ Limit order failed, retrying with market order: {e}")
+                log_event("warn", "TradeEngine", f"Limit order failed; retrying market order: {e}")
                 try:
                     order = exchange.create_order(symbol, "market", "buy", amount)
                 except Exception as e2:
-                    print(f"❌ Market order also failed: {e2}")
-                    send_telegram_alert(f"❌ Trade failed for {symbol}. Limit and market both failed.")
+                    log_event("error", "TradeEngine", f"Market order also failed: {e2}")
                     return None
         elif side == "sell":
-            order = exchange.create_limit_sell_order(symbol, amount, limit_price)
+            order = exchange.create_order(symbol, "limit", "sell", amount, limit_price)
         else:
-            send_telegram_alert(f"❌ Invalid trade side: {side}")
+            log_event("error", "TradeEngine", f"Invalid trade side '{side}' for {symbol}")
             return None
         # --- End retry block ---
 
@@ -1063,8 +1087,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
 
         if filled_amount <= 0:
             message = f"⏹️ {symbol} {side} order not filled (status: {status})."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         executed_price = final_order.get('average') or final_order.get('price') or fallback_price
@@ -1073,8 +1096,7 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
 
         if executed_price is None or executed_price <= 0:
             message = f"⚠️ {symbol} execution price unavailable; skipping trade log."
-            print(message)
-            send_telegram_alert(message)
+            log_event("warn", "TradeEngine", message)
             return None
 
         executed_price = float(executed_price)
@@ -1113,12 +1135,10 @@ def execute_trade(symbol, side, amount, price=None, reason: str = "Live trade ex
             "executed_price": executed_price,
         }
     except (NetworkError, ExchangeError) as e:
-        send_telegram_alert(f"⚠️ Exchange communication error: {type(e).__name__} - {e}")
-        print(f"⚠️ Exchange communication error during trade: {e}")
+        log_event("warn", "TradeEngine", f"Exchange error {type(e).__name__}: {e}")
         return None
     except Exception as e:
-        send_telegram_alert(f"❌ Unexpected error: {e}")
-        print(f"❌ Trade execution failed: {e}")
+        log_event("error", "TradeEngine", f"Unexpected error: {e}")
         return None
 
 # === POSITION MONITORING ===
@@ -1568,6 +1588,16 @@ def scan_top_cryptos(
             candidate = {
                 "symbol": symbol,
                 "score": score,
+                "ema_slope": ema_slope,
+                "rsi": rsi_1h,
+                "adx": adx_1h,
+                "atr": atr_value,
+                "atr_pct": atr_pct,
+                "volatility": volatility,
+                "depth_ratio": depth_ratio,
+                "bid_ask_spread": spread_pct,
+                "price": last_price,
+                "quote_volume": quote_volume,
                 "reasons": reasons,
                 "indicators": {
                     "last_price": last_price,
@@ -1660,7 +1690,12 @@ def scan_top_cryptos(
                 )
             return []
 
-        candidates.sort(key=lambda item: (-(item.get('score') or 0), -(item.get('indicators', {}).get('quote_volume') or 0)))
+        candidates.sort(
+            key=lambda item: (
+                -(item.get('score') or 0),
+                -(item.get('quote_volume') or item.get('indicators', {}).get('quote_volume') or 0)
+            )
+        )
         top_candidates = candidates[:limit]
         log_scanner_snapshot(top_candidates)
         print("✅ Scanner picks:", [(c['symbol'], c['score']) for c in top_candidates])
@@ -1670,82 +1705,13 @@ def scan_top_cryptos(
         return []
 
 
-def validate_entry_conditions(symbol: str) -> Tuple[bool, str, Dict[str, float]]:
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-    except Exception as err:
-        return False, f"Ticker fetch failed: {err}", {}
-
-    quote_volume = extract_quote_volume(ticker)
-    if quote_volume is None or quote_volume < MIN_QUOTE_VOLUME_24H:
-        return False, "Quote volume below minimum threshold", {}
-
-    bid = ticker.get('bid')
-    ask = ticker.get('ask')
-    if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)) or bid <= 0 or ask <= 0 or ask <= bid:
-        return False, "Spread check failed", {}
-    mid_price = (bid + ask) / 2
-    spread_pct = ((ask - bid) / mid_price) * 100 if mid_price > 0 else None
-    if spread_pct is None or spread_pct > MAX_SPREAD_PERCENT:
-        return False, "Spread too wide", {}
-
-    try:
-        ohlcv = fetch_ohlcv_cached(symbol, timeframe='1h', limit=150, ttl=OHLCV_CACHE_TTL_SECONDS)
-    except Exception as err:
-        return False, f"OHLCV fetch failed: {err}", {}
-
-    if not ohlcv or len(ohlcv) < 80:
-        return False, "Insufficient OHLCV data", {}
-
-    closes = [c[4] for c in ohlcv]
-    highs = [c[2] for c in ohlcv]
-    lows = [c[3] for c in ohlcv]
-    volumes = [c[5] for c in ohlcv]
-
-    if not closes or closes[-1] is None:
-        return False, "Invalid close data", {}
-
-    last_price = float(closes[-1])
-    if last_price <= 0:
-        return False, "Last price invalid", {}
-
-    ema9_series = calculate_ema_series(closes, 9)
-    ema21_series = calculate_ema_series(closes, 21)
-    ema50_series = calculate_ema_series(closes, 50)
-    if not ema9_series or not ema21_series or not ema50_series:
-        return False, "EMA series unavailable", {}
-
-    ema9 = ema9_series[-1]
-    ema21 = ema21_series[-1]
-    ema50 = ema50_series[-1]
-    if not (ema9 > ema21 > ema50):
-        return False, "EMA stack lost", {}
-
-    rsi_values = calculate_rsi(closes)
-    if not rsi_values:
-        return False, "RSI unavailable", {}
-    rsi = rsi_values[-1]
-    if rsi < 40 or rsi > 78:
-        return False, f"RSI out of range ({rsi:.1f})", {}
-
-    atr_value = compute_atr(highs, lows, closes)
-    atr_pct = (atr_value / last_price) if atr_value else None
-    if atr_pct and atr_pct > MAX_ATR_PERCENT:
-        return False, f"ATR too high ({atr_pct:.3f})", {}
-
-    avg_vol_20 = np.mean(volumes[-20:]) if len(volumes) >= 20 else None
-    volume_ratio = (volumes[-1] / avg_vol_20) if avg_vol_20 else None
-    if volume_ratio and volume_ratio < 1.0:
-        return False, "Volume momentum faded", {}
-
-    return True, "", {
-        "last_price": last_price,
-        "quote_volume": quote_volume,
-        "spread_pct": spread_pct,
-        "rsi": rsi,
-        "atr_pct": atr_pct,
-        "volume_ratio": volume_ratio,
-    }
+def validate_entry_conditions(candidate: Optional[Dict[str, object]]) -> bool:
+    if not candidate:
+        return False
+    score_ok = candidate.get("score", 0) >= 5
+    rsi = candidate.get("rsi")
+    rsi_ok = isinstance(rsi, (int, float)) and 40 <= rsi <= 70
+    return score_ok and rsi_ok
 
 
 def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
@@ -1840,182 +1806,116 @@ def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
     return regime_last_result
 
 
-def allocate_trade_sizes(candidates: List[Dict[str, object]], total_allocatable: float) -> Dict[str, float]:
-    if total_allocatable <= 0 or not candidates:
-        return {}
-    weights = []
-    for candidate in candidates:
-        indicators = candidate.get('indicators', {})
-        atr_pct = indicators.get('atr_pct') or 0.02
-        atr_pct = max(float(atr_pct), 0.01)
-        weights.append(1 / atr_pct)
-    weight_sum = sum(weights)
-    allocations: Dict[str, float] = {}
-    if weight_sum <= 0:
-        per_symbol = total_allocatable / len(candidates)
-        for candidate in candidates:
-            allocations[candidate['symbol']] = per_symbol
-        return allocations
-    for candidate, weight in zip(candidates, weights):
-        allocations[candidate['symbol']] = total_allocatable * (weight / weight_sum)
-    return allocations
+def calculate_position_size(
+    candidate: Dict[str, object],
+    quote_budget: float
+) -> float:
+    """Derive a position size (base units) from a quote notional budget and candidate data."""
+    price = candidate.get("price")
+    if not isinstance(price, (int, float)) or price <= 0:
+        return 0.0
+    exposure_cap_remaining = max(MAX_TOTAL_EXPOSURE_USD - current_total_exposure(), 0.0)
+    if exposure_cap_remaining <= 0:
+        return 0.0
+    trade_notional = min(max(quote_budget, 0.0), exposure_cap_remaining)
+    trade_notional = min(trade_notional, exposure_cap_remaining)
+    if trade_notional <= 0:
+        return 0.0
+    return trade_notional / price
 
 # === MAIN LOOP ENTRY POINT ===
 def run_bot():
-    global last_portfolio_snapshot
-    print("🔁 Starting OMEGA-VX-CRYPTO bot loop...")
+    global last_loop_start_str, last_portfolio_snapshot
+    log_event("info", "MainLoop", "Starting OMEGA-VX-CRYPTO loop…")
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
-        print("🌀 Cycle started: scanning market and monitoring positions...")
-        loop_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        global last_loop_start_str
-        last_loop_start_str = loop_start
-        print(f"🔁 Loop started at {loop_start} UTC", flush=True)
         try:
+            loop_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            last_loop_start_str = loop_start
             monitor_positions()
+
             regime_ok, regime_reason = evaluate_market_regime()
             if not regime_ok:
-                metrics = last_regime_metrics or {}
-                ema_21 = metrics.get('ema_fast')
-                ema_55 = metrics.get('ema_slow')
-                roc = metrics.get('roc')
-                if all(isinstance(val, (int, float)) for val in (ema_21, ema_55, roc)):
-                    print(
-                        f"🛡️ Regime defensive at {loop_start}: EMA21={ema_21:.2f}, "
-                        f"EMA55={ema_55:.2f}, ROC={roc:.2f}%",
-                        flush=True
-                    )
-                else:
-                    print(f"🛡️ Regime defensive at {loop_start}: {regime_reason}", flush=True)
-                print("📉 Market conditions not favorable — skipping trade evaluation this cycle.")
-                time.sleep(BotConfig.LOOP_SLEEP_SECONDS)
+                log_event("warn", "MainLoop", f"Regime defensive: {regime_reason}")
+                time.sleep(config.LOOP_SLEEP_SECONDS)
                 continue
 
-            # Adaptive trade amount based on available quote balance
             try:
                 balance = exchange.fetch_balance()
                 free_balances = balance.get('free') or {}
                 quote_asset, quote_available = pick_quote_balance(free_balances)
-                if quote_available < 1:
-                    print(f"⚠️ Not enough free {quote_asset} balance to trade.")
-                    time.sleep(10)
-                    continue
-            except Exception as e:
-                send_telegram_alert(f"⚠️ Failed to fetch balance for dynamic trade sizing: {e}")
-                time.sleep(10)
+            except Exception as balance_err:
+                log_event("warn", "MainLoop", f"Failed to fetch balance: {balance_err}")
+                time.sleep(config.LOOP_SLEEP_SECONDS)
                 continue
+
+            quote_budget = max(quote_available * 0.95, 0.0)
+            per_trade_cap = quote_available * RISK_PER_TRADE_PCT
 
             candidates = scan_top_cryptos(limit=SCANNER_MAX_CANDIDATES, quote_asset=quote_asset)
             if not candidates:
-                print("⚠️ No valid pairs found.")
-                time.sleep(10)
+                log_event("info", "MainLoop", "No valid candidates this cycle.")
+                time.sleep(config.LOOP_SLEEP_SECONDS)
                 continue
 
-            total_allocatable = quote_available * 0.95
-            allocations = allocate_trade_sizes(candidates, total_allocatable)
-            risk_budget_remaining = max(quote_available * RISK_PER_TRADE_PCT, 0.0)
-            print(
-                f"💰 Total {quote_asset}: {quote_available:.2f}, Allocatable: {total_allocatable:.2f}, "
-                f"Risk Budget: {risk_budget_remaining:.2f}, "
-                f"Candidates: {[(c['symbol'], round(allocations.get(c['symbol'], 0), 2)) for c in candidates]}"
-            )
-
-            summary = ", ".join([f"{c['symbol']} (score {c['score']})" for c in candidates])
-            send_telegram_alert(f"🧠 Scanner picks: {summary}")
-
             for candidate in candidates:
-                symbol = candidate[0] if isinstance(candidate, (list, tuple)) else candidate.get('symbol')
-                if isinstance(candidate, (list, tuple)):
-                    # If candidate is a tuple/list, try to build a dict-like interface for compatibility
-                    candidate_dict = {}
-                    if len(candidate) > 0:
-                        candidate_dict['symbol'] = candidate[0]
-                    if len(candidate) > 1:
-                        candidate_dict['score'] = candidate[1]
-                    candidate = candidate_dict
-                if symbol.upper() in RESTRICTED_SYMBOLS:
-                    print(f"🚫 {symbol} entry blocked: symbol restricted.")
-                    continue
-                quote_budget = allocations.get(symbol, 0)
-                if quote_budget <= 0:
-                    print(f"⚠️ No {quote_asset} allocation for {symbol}; skipping.")
+                symbol = candidate.get("symbol")
+                if not symbol or symbol.upper() in RESTRICTED_SYMBOLS:
                     continue
                 if symbol in open_positions:
-                    print(f"⏸️ Already holding {symbol}; skipping new entry.")
                     continue
-                if risk_budget_remaining <= 0:
-                    print("⚠️ Risk budget exhausted; skipping remaining candidates.")
+                if not validate_entry_conditions(candidate):
+                    continue
+                if quote_budget <= 0:
+                    log_event("warn", "MainLoop", "Quote budget exhausted for this cycle.")
                     break
 
-                valid, rejection_reason, metrics = validate_entry_conditions(symbol)
-                if not valid:
-                    print(f"🚫 {symbol} entry blocked: {rejection_reason}")
-                    continue
-
-                price = metrics.get('last_price') or candidate.get('indicators', {}).get('last_price') if isinstance(candidate, dict) else None
-                if not price or price <= 0:
-                    print(f"⚠️ Unable to determine price for {symbol}; skipping.")
-                    continue
-
-                atr_pct = metrics.get('atr_pct')
-                atr_stop_pct = None
-                if isinstance(atr_pct, (int, float)) and atr_pct > 0:
-                    atr_stop_pct = ATR_HARD_STOP_MULTIPLIER * float(atr_pct)
-
-                trade_notional = min(quote_budget, risk_budget_remaining)
-                if trade_notional <= 0:
-                    print(f"⚠️ Risk budget allows no additional exposure for {symbol}; skipping.")
-                    continue
-
-                position_size = trade_notional / price
+                trade_notional = min(quote_budget, per_trade_cap)
+                position_size = calculate_position_size(candidate, trade_notional)
                 if position_size <= 0:
-                    print(f"⚠️ Computed zero position size for {symbol}; skipping.")
                     continue
 
-                # Execute buy
-                trade_result = execute_trade(symbol, "buy", position_size, price, reason="Signal entry")
-                if not trade_result:
-                    continue
-
-                filled_amt = trade_result.get("filled_amount")
-                executed_price = trade_result.get("executed_price")
-
-                # Log trade features for analytics
-                log_trade_features(
-                    symbol=symbol,
-                    score=candidate.get("score"),
-                    indicators=candidate.get("indicators"),
-                    reasons=candidate.get("reasons"),
-                    filled_amount=filled_amt,
-                    executed_price=executed_price,
-                    actual_notional=(filled_amt or 0) * (executed_price or 0),
-                    effective_stop_pct=atr_stop_pct,
+                order_result = execute_trade(
+                    symbol,
+                    "buy",
+                    position_size,
+                    candidate.get("price"),
+                    reason="Signal entry"
                 )
+                if not order_result:
+                    continue
 
-                # Decrement risk budget after each trade
-                risk_budget_remaining -= trade_notional
-                if risk_budget_remaining <= 0:
-                    print("⚠️ Risk budget fully consumed.")
-                    break
+                if order_result.get("status") != "dry_run":
+                    filled_amt = order_result.get("filled_amount")
+                    executed_price = order_result.get("executed_price") or candidate.get("price")
+                    log_trade_features(
+                        symbol=symbol,
+                        score=candidate.get("score"),
+                        indicators=candidate.get("indicators"),
+                        reasons=candidate.get("reasons"),
+                        filled_amount=filled_amt,
+                        executed_price=executed_price,
+                        actual_notional=(filled_amt or 0) * (executed_price or 0),
+                        effective_stop_pct=(
+                            ATR_HARD_STOP_MULTIPLIER * float(candidate.get("atr_pct"))
+                            if isinstance(candidate.get("atr_pct"), (int, float))
+                            else None
+                        ),
+                    )
+                    quote_budget = max(quote_budget - trade_notional, 0.0)
 
-            # Periodic equity snapshot
-            global last_portfolio_snapshot
             now_ts = time.time()
             if now_ts - last_portfolio_snapshot > PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:
                 log_portfolio_snapshot()
                 last_portfolio_snapshot = now_ts
 
+            time.sleep(config.LOOP_SLEEP_SECONDS)
         except (NetworkError, ExchangeError) as loop_err:
-            send_telegram_alert(
-                f"⚠️ Exchange communication error: {type(loop_err).__name__} - {loop_err}"
-            )
-            print(f"⚠️ Exchange communication error in main loop: {loop_err}")
+            log_event("warn", "MainLoop", f"Exchange connectivity issue: {loop_err}")
+            time.sleep(config.LOOP_SLEEP_SECONDS)
         except Exception as loop_err:
-            send_telegram_alert(f"⚠️ Main loop exception: {loop_err}")
-            print(f"⚠️ Main loop exception: {loop_err}")
-
-        print(f"🌙 Cycle complete. Sleeping {BotConfig.LOOP_SLEEP_SECONDS}s before next iteration...", flush=True)
-        time.sleep(BotConfig.LOOP_SLEEP_SECONDS)
+            log_event("error", "MainLoop", f"Unexpected error: {loop_err}")
+            time.sleep(config.LOOP_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
