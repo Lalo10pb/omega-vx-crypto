@@ -119,6 +119,33 @@ RESTRICTED_SYMBOLS = {
 }
 PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS", 1800))
 
+SOFT_VOLUME_MULTIPLIER = float(os.getenv("SOFT_VOLUME_MULTIPLIER", 0.6))
+SOFT_SPREAD_BUFFER = float(os.getenv("SOFT_SPREAD_BUFFER", 0.15))
+SOFT_DEPTH_BUFFER = float(os.getenv("SOFT_DEPTH_BUFFER", 0.05))
+MIN_CANDIDATE_SCORE = float(os.getenv("MIN_CANDIDATE_SCORE", 4.0))
+SCANNER_NEAR_MISS_PATH = os.getenv("SCANNER_NEAR_MISS_PATH", "scanner_near_miss_log.csv")
+
+SCORING_WEIGHTS = {
+    "ema_stack": float(os.getenv("WEIGHT_EMA_STACK", 2.5)),
+    "fresh_cross": float(os.getenv("WEIGHT_FRESH_CROSS", 1.5)),
+    "rsi": float(os.getenv("WEIGHT_RSI", 1.2)),
+    "rsi_penalty": float(os.getenv("WEIGHT_RSI_PENALTY", 0.6)),
+    "ema_slope": float(os.getenv("WEIGHT_EMA_SLOPE", 1.4)),
+    "volume_ratio": float(os.getenv("WEIGHT_VOLUME_RATIO", 1.0)),
+    "adx": float(os.getenv("WEIGHT_ADX", 1.0)),
+    "macd": float(os.getenv("WEIGHT_MACD", 1.0)),
+    "roc": float(os.getenv("WEIGHT_ROC", 0.9)),
+    "timeframe_alignment": float(os.getenv("WEIGHT_TIMEFRAME_ALIGNMENT", 1.1)),
+    "depth": float(os.getenv("WEIGHT_DEPTH", 0.8)),
+    "new_listing": float(os.getenv("WEIGHT_NEW_LISTING", 0.5)),
+    "volatility": float(os.getenv("WEIGHT_VOLATILITY", 0.8)),
+    "regime_bull": float(os.getenv("WEIGHT_REGIME_BULL", 0.7)),
+    "regime_bear": float(os.getenv("WEIGHT_REGIME_BEAR", 1.2)),
+    "volume_penalty": float(os.getenv("WEIGHT_VOLUME_PENALTY", 2.0)),
+    "spread_penalty": float(os.getenv("WEIGHT_SPREAD_PENALTY", 1.5)),
+    "depth_penalty": float(os.getenv("WEIGHT_DEPTH_PENALTY", 1.3)),
+}
+
  # === CONFIGURATION ===
 # trade_amount_usd = 25  # USD amount per trade (adjusted to increase capital usage)
 
@@ -1304,6 +1331,37 @@ def log_scanner_snapshot(records: List[Dict]) -> None:
         print(f"⚠️ Failed to persist scanner snapshot: {err}")
 
 
+def log_near_misses(entries: List[Dict[str, object]]) -> None:
+    if not entries:
+        return
+    try:
+        file_exists = os.path.exists(SCANNER_NEAR_MISS_PATH)
+        fieldnames = [
+            "timestamp",
+            "symbol",
+            "reason",
+            "quote_volume",
+            "volume_threshold",
+            "soft_volume_threshold",
+            "spread_pct",
+            "max_spread_percent",
+            "soft_spread_limit",
+            "depth_ratio",
+            "min_depth_imbalance",
+            "soft_depth_ratio",
+            "atr_pct",
+            "regime_state"
+        ]
+        with open(SCANNER_NEAR_MISS_PATH, mode="a", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            for entry in entries:
+                writer.writerow(entry)
+    except Exception as err:
+        print(f"⚠️ Failed to persist near-miss log: {err}")
+
+
 def extract_quote_volume(ticker: Dict) -> Optional[float]:
     if not isinstance(ticker, dict):
         return None
@@ -1350,6 +1408,31 @@ def scan_top_cryptos(
                 f"(default {MIN_QUOTE_VOLUME_24H:,.0f})."
             )
 
+        soft_volume_threshold = max(fallback_volume, volume_threshold * SOFT_VOLUME_MULTIPLIER)
+        soft_spread_limit = MAX_SPREAD_PERCENT + SOFT_SPREAD_BUFFER
+        soft_depth_ratio = max(0.0, MIN_DEPTH_IMBALANCE - SOFT_DEPTH_BUFFER)
+        near_miss_entries: List[Dict[str, object]] = []
+
+        regime_ok, regime_reason = evaluate_market_regime()
+        regime_state = "bull" if regime_ok else "bear"
+
+        def record_near_miss(symbol_name: str, reason: str, extra: Optional[Dict[str, object]] = None) -> None:
+            payload: Dict[str, object] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol_name,
+                "reason": reason,
+                "volume_threshold": volume_threshold,
+                "soft_volume_threshold": soft_volume_threshold,
+                "max_spread_percent": MAX_SPREAD_PERCENT,
+                "soft_spread_limit": soft_spread_limit,
+                "min_depth_imbalance": MIN_DEPTH_IMBALANCE,
+                "soft_depth_ratio": soft_depth_ratio,
+                "regime_state": regime_state,
+            }
+            if extra:
+                payload.update(extra)
+            near_miss_entries.append(payload)
+
         restricted_keywords = ["RETARDIO", "SPICE", "KERNEL", "HIPPO", "MERL", "DEGEN", "BMT"]
 
         tickers = list(markets.items())
@@ -1382,34 +1465,76 @@ def scan_top_cryptos(
                 continue
 
             quote_volume = extract_quote_volume(ticker)
-            if quote_volume is None or quote_volume < volume_threshold:
-                vol_text = (
-                    "unavailable"
-                    if quote_volume is None
-                    else f"{quote_volume:.2f} < min {volume_threshold:.2f}"
-                )
-                log_skip(symbol, f"failed volume filter ({vol_text})")
+            if quote_volume is None:
+                record_near_miss(symbol, "volume unavailable", {"quote_volume": 0.0})
+                log_skip(symbol, "failed volume filter (unavailable)")
                 continue
+            if quote_volume < soft_volume_threshold:
+                record_near_miss(
+                    symbol,
+                    "volume below soft floor",
+                    {"quote_volume": quote_volume}
+                )
+                log_skip(
+                    symbol,
+                    f"failed volume filter ({quote_volume:.2f} < soft min {soft_volume_threshold:.2f})"
+                )
+                continue
+            volume_penalty = 0.0
+            volume_note = ""
+            if quote_volume < volume_threshold and volume_threshold > 0:
+                deficit_pct = 1 - (quote_volume / volume_threshold)
+                volume_penalty = deficit_pct * SCORING_WEIGHTS.get("volume_penalty", 0.0)
+                volume_note = f"Volume deficit {deficit_pct*100:.1f}%"
+                record_near_miss(
+                    symbol,
+                    "volume below preferred threshold",
+                    {"quote_volume": quote_volume}
+                )
 
             bid = ticker.get('bid')
             ask = ticker.get('ask')
             if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)):
+                record_near_miss(symbol, "bid/ask invalid", {"quote_volume": quote_volume})
                 log_skip(symbol, "bid/ask not numeric")
                 continue
             if bid <= 0 or ask <= 0 or ask <= bid:
+                record_near_miss(symbol, "bid/ask invalid spread", {"quote_volume": quote_volume})
                 log_skip(symbol, "invalid bid/ask spread")
                 continue
             mid_price = (bid + ask) / 2
             spread_pct = ((ask - bid) / mid_price) * 100 if mid_price > 0 else None
-            if spread_pct is None or spread_pct > MAX_SPREAD_PERCENT:
-                if spread_pct is None:
-                    log_skip(symbol, "spread unavailable")
-                else:
-                    log_skip(symbol, f"failed spread filter ({spread_pct:.2f}% > {MAX_SPREAD_PERCENT:.2f}%)")
+            if spread_pct is None:
+                record_near_miss(symbol, "spread unavailable", {"quote_volume": quote_volume})
+                log_skip(symbol, "spread unavailable")
                 continue
+            if spread_pct > soft_spread_limit:
+                record_near_miss(
+                    symbol,
+                    "spread above soft limit",
+                    {"quote_volume": quote_volume, "spread_pct": spread_pct}
+                )
+                log_skip(symbol, f"failed spread filter ({spread_pct:.2f}% > soft {soft_spread_limit:.2f}%)")
+                continue
+            spread_penalty = 0.0
+            spread_note = ""
+            if spread_pct > MAX_SPREAD_PERCENT:
+                over_pct = (spread_pct - MAX_SPREAD_PERCENT) / MAX_SPREAD_PERCENT if MAX_SPREAD_PERCENT > 0 else 0.0
+                spread_penalty = over_pct * SCORING_WEIGHTS.get("spread_penalty", 0.0)
+                spread_note = f"Spread penalty {over_pct*100:.1f}%"
+                record_near_miss(
+                    symbol,
+                    "spread above preferred threshold",
+                    {"quote_volume": quote_volume, "spread_pct": spread_pct}
+                )
 
             depth_metrics = fetch_orderbook_metrics(symbol)
             if not depth_metrics:
+                record_near_miss(
+                    symbol,
+                    "order book metrics unavailable",
+                    {"quote_volume": quote_volume, "spread_pct": spread_pct}
+                )
                 log_skip(symbol, "order book metrics unavailable")
                 continue
             depth_spread_pct = depth_metrics.get('spread_pct')
@@ -1417,16 +1542,48 @@ def scan_top_cryptos(
                 log_skip(symbol, f"order book spread high ({depth_spread_pct:.2f}% > {MAX_SPREAD_PERCENT:.2f}%)")
                 continue
             depth_ratio = depth_metrics.get('depth_ratio')
-            if depth_ratio is None or depth_ratio < MIN_DEPTH_IMBALANCE:
-                ratio_text = "unavailable" if depth_ratio is None else f"{depth_ratio:.2f} < {MIN_DEPTH_IMBALANCE:.2f}"
-                log_skip(symbol, f"failed depth imbalance ({ratio_text})")
+            if depth_ratio is None:
+                record_near_miss(
+                    symbol,
+                    "depth ratio unavailable",
+                    {"quote_volume": quote_volume, "spread_pct": spread_pct}
+                )
+                log_skip(symbol, "failed depth imbalance (unavailable)")
                 continue
+            if depth_ratio < soft_depth_ratio:
+                record_near_miss(
+                    symbol,
+                    "depth ratio below soft floor",
+                    {"quote_volume": quote_volume, "spread_pct": spread_pct, "depth_ratio": depth_ratio}
+                )
+                log_skip(symbol, f"failed depth imbalance ({depth_ratio:.2f} < soft {soft_depth_ratio:.2f})")
+                continue
+            depth_penalty = 0.0
+            depth_note = ""
+            if depth_ratio < MIN_DEPTH_IMBALANCE:
+                deficit_ratio = (MIN_DEPTH_IMBALANCE - depth_ratio) / MIN_DEPTH_IMBALANCE if MIN_DEPTH_IMBALANCE > 0 else 0.0
+                depth_penalty = deficit_ratio * SCORING_WEIGHTS.get("depth_penalty", 0.0)
+                depth_note = f"Depth deficit {deficit_ratio*100:.1f}%"
+                record_near_miss(
+                    symbol,
+                    "depth ratio below preferred threshold",
+                    {"quote_volume": quote_volume, "spread_pct": spread_pct, "depth_ratio": depth_ratio}
+                )
             depth_mid_price = depth_metrics.get('mid_price') or mid_price
             bid_band_volume = float(depth_metrics.get('bid_volume_band') or 0.0)
             ask_band_volume = float(depth_metrics.get('ask_volume_band') or 0.0)
             bid_band_notional = bid_band_volume * depth_mid_price
             ask_band_notional = ask_band_volume * depth_mid_price
             if bid_band_notional < MIN_DEPTH_NOTIONAL_USD or ask_band_notional < MIN_DEPTH_NOTIONAL_USD:
+                record_near_miss(
+                    symbol,
+                    "order book notional too low",
+                    {
+                        "quote_volume": quote_volume,
+                        "spread_pct": spread_pct,
+                        "depth_ratio": depth_ratio
+                    }
+                )
                 log_skip(
                     symbol,
                     f"order book notional too low (bid ${bid_band_notional:.2f}, ask ${ask_band_notional:.2f})"
@@ -1477,6 +1634,16 @@ def scan_top_cryptos(
             atr_value = compute_atr(highs_1h, lows_1h, closes_1h)
             atr_pct = (atr_value / last_price) if atr_value else None
             if atr_pct and atr_pct > MAX_ATR_PERCENT:
+                record_near_miss(
+                    symbol,
+                    "atr volatility high",
+                    {
+                        "quote_volume": quote_volume,
+                        "spread_pct": spread_pct,
+                        "depth_ratio": depth_ratio,
+                        "atr_pct": atr_pct * 100
+                    }
+                )
                 log_skip(symbol, f"failed volatility filter (ATR {atr_pct*100:.2f}% > {MAX_ATR_PERCENT*100:.2f}% max)")
                 continue
 
@@ -1536,58 +1703,139 @@ def scan_top_cryptos(
                 listing_age_days is not None and listing_age_days <= NEW_LISTING_BOOST_DAYS
             )
 
-            score = 0
+            score = 0.0
             reasons: List[str] = []
+            penalty_notes: List[str] = []
+            penalty_total = volume_penalty + spread_penalty + depth_penalty
+
+            for note in (volume_note, spread_note, depth_note):
+                if note:
+                    penalty_notes.append(note)
+
+            if regime_ok:
+                score += SCORING_WEIGHTS.get("regime_bull", 0.0)
+                reasons.append("Regime aligned (bullish bias)")
+            else:
+                penalty_total += SCORING_WEIGHTS.get("regime_bear", 0.0)
+                penalty_notes.append(f"Regime headwind: {regime_reason}")
 
             if ema9 > ema21 > ema50:
-                score += 2
-                reasons.append("1h EMA stack bullish")
-            if fresh_signal:
-                score += 1
-                reasons.append(f"Fresh EMA cross ({fresh_signal_age} bars ago)")
-            if 45 <= rsi_1h <= 75:
-                score += 1
-                reasons.append(f"RSI in momentum zone ({rsi_1h:.1f})")
-            if volume_ratio and volume_ratio >= 1.5:
-                score += 1
-                reasons.append(f"Volume x{volume_ratio:.2f} vs avg")
-            if adx_1h and adx_1h >= 20:
-                score += 1
-                reasons.append(f"ADX strong ({adx_1h:.1f})")
-            if macd_hist_slope and macd_hist_slope > 0:
-                score += 1
-                reasons.append("MACD momentum rising")
-            if roc_pct and roc_pct > 0.3:
-                score += 1
-                reasons.append(f"ROC positive ({roc_pct:.2f}%)")
-            if timeframe_alignment_flags:
-                score += len(timeframe_alignment_flags)
-                reasons.append("Multi-timeframe uptrend: " + ", ".join(timeframe_alignment_flags))
-            if depth_ratio and depth_ratio >= MIN_DEPTH_IMBALANCE:
-                score += 1
-                reasons.append(
-                    f"Order-book bids {depth_ratio:.2f}x asks inside {DEPTH_BAND_PERCENT:.1f}%"
-                )
-            if is_new_listing:
-                score += 1
-                reasons.append(f"Fresh Kraken listing (~{listing_age_days:.1f}d)")
+                stack_weight = SCORING_WEIGHTS.get("ema_stack", 0.0)
+                score += stack_weight
+                reasons.append(f"1h EMA stack bullish (+{stack_weight:.2f})")
 
-            # Compute extra diagnostics for logging
+            if fresh_signal and fresh_signal_age is not None:
+                freshness = max(0.0, (FRESH_SIGNAL_LOOKBACK + 1 - fresh_signal_age) / (FRESH_SIGNAL_LOOKBACK + 1))
+                boost = freshness * SCORING_WEIGHTS.get("fresh_cross", 0.0)
+                score += boost
+                reasons.append(f"Fresh EMA cross ({fresh_signal_age} bars ago, +{boost:.2f})")
+
+            if isinstance(rsi_1h, (int, float)):
+                if 35 <= rsi_1h <= 80:
+                    center = 60.0
+                    alignment = max(0.0, 1 - abs(rsi_1h - center) / 25.0)
+                    if alignment > 0:
+                        rsi_boost = alignment * SCORING_WEIGHTS.get("rsi", 0.0)
+                        score += rsi_boost
+                        reasons.append(f"RSI alignment ({rsi_1h:.1f}, +{rsi_boost:.2f})")
+                else:
+                    rsi_penalty = (min(abs(rsi_1h - 60.0), 40.0) / 40.0) * SCORING_WEIGHTS.get("rsi_penalty", 0.0)
+                    penalty_total += rsi_penalty
+                    penalty_notes.append(f"RSI penalty ({rsi_1h:.1f}, -{rsi_penalty:.2f})")
+
+            if volume_ratio and volume_ratio >= 1.0:
+                volume_strength = min(volume_ratio - 1.0, 2.5)
+                if volume_strength > 0:
+                    volume_boost = volume_strength * SCORING_WEIGHTS.get("volume_ratio", 0.0)
+                    score += volume_boost
+                    reasons.append(f"Volume impulse x{volume_ratio:.2f} (+{volume_boost:.2f})")
+
+            if adx_1h and adx_1h >= 20:
+                adx_strength = min((adx_1h - 20) / 25.0, 1.0)
+                if adx_strength > 0:
+                    adx_boost = adx_strength * SCORING_WEIGHTS.get("adx", 0.0)
+                    score += adx_boost
+                    reasons.append(f"ADX trend {adx_1h:.1f} (+{adx_boost:.2f})")
+
+            if macd_hist_slope is not None:
+                if macd_hist_slope > 0:
+                    macd_strength = min(macd_hist_slope, 0.03) / 0.03
+                    macd_boost = macd_strength * SCORING_WEIGHTS.get("macd", 0.0)
+                    score += macd_boost
+                    reasons.append(f"MACD momentum rising (+{macd_boost:.2f})")
+                else:
+                    macd_penalty = min(abs(macd_hist_slope), 0.03) / 0.03 * (SCORING_WEIGHTS.get("macd", 0.0) / 2)
+                    penalty_total += macd_penalty
+                    penalty_notes.append(f"MACD momentum fading (-{macd_penalty:.2f})")
+
+            if roc_pct is not None:
+                if roc_pct > 0:
+                    roc_strength = min(roc_pct / 2.0, 1.0)
+                    roc_boost = roc_strength * SCORING_WEIGHTS.get("roc", 0.0)
+                    score += roc_boost
+                    reasons.append(f"ROC positive ({roc_pct:.2f}%, +{roc_boost:.2f})")
+                else:
+                    roc_penalty = min(abs(roc_pct) / 2.0, 1.0) * (SCORING_WEIGHTS.get("roc", 0.0) / 2)
+                    penalty_total += roc_penalty
+                    penalty_notes.append(f"ROC negative ({roc_pct:.2f}%, -{roc_penalty:.2f})")
+
+            if timeframe_alignment_flags:
+                tf_boost = len(timeframe_alignment_flags) * SCORING_WEIGHTS.get("timeframe_alignment", 0.0)
+                score += tf_boost
+                reasons.append(f"Multi-timeframe uptrend ({', '.join(timeframe_alignment_flags)}, +{tf_boost:.2f})")
+
+            if depth_ratio:
+                depth_strength = max(0.0, min(depth_ratio / max(MIN_DEPTH_IMBALANCE, 1e-6), 1.5) - 1.0)
+                if depth_strength > 0:
+                    depth_boost = depth_strength * SCORING_WEIGHTS.get("depth", 0.0)
+                    score += depth_boost
+                    reasons.append(
+                        f"Order-book support {depth_ratio:.2f}x (+{depth_boost:.2f})"
+                    )
+
+            if is_new_listing:
+                listing_boost = SCORING_WEIGHTS.get("new_listing", 0.0)
+                score += listing_boost
+                reasons.append(f"Fresh Kraken listing (~{listing_age_days:.1f}d, +{listing_boost:.2f})")
+
             ema_slope = (ema9 - ema21) / ema21 if ema21 else 0.0
+            if ema_slope > 0:
+                slope_strength = min(ema_slope / 0.03, 1.0)
+                slope_boost = slope_strength * SCORING_WEIGHTS.get("ema_slope", 0.0)
+                score += slope_boost
+                reasons.append(f"EMA slope {ema_slope:.4f} (+{slope_boost:.2f})")
+
+            if atr_pct is not None and MAX_ATR_PERCENT > 0:
+                stability = max(0.0, 1 - (atr_pct / MAX_ATR_PERCENT))
+                if stability > 0:
+                    volatility_boost = stability * SCORING_WEIGHTS.get("volatility", 0.0)
+                    score += volatility_boost
+                    reasons.append(f"Contained volatility ({atr_pct*100:.2f}%, +{volatility_boost:.2f})")
+
+            final_score = max(score - penalty_total, 0.0)
+            if penalty_notes:
+                reasons.extend(f"⚠️ {note}" for note in penalty_notes)
+
             volatility = atr_pct or 0.0
             print(
-                f"🔬 {symbol} — Score: {score} | EMA Slope: {ema_slope:.4f} | "
+                f"🔬 {symbol} — Score: {final_score:.2f} | EMA Slope: {ema_slope:.4f} | "
                 f"RSI: {rsi_1h:.2f} | Volatility: {volatility:.4f}",
                 flush=True
             )
 
-            if score < 2:
-                print(f"⏭️ Skipped {symbol}: Did not pass filters (score={score})", flush=True)
+            if final_score < MIN_CANDIDATE_SCORE:
+                print(
+                    f"⏭️ Skipped {symbol}: Did not pass smart-score filter "
+                    f"(score={final_score:.2f} < {MIN_CANDIDATE_SCORE:.2f})",
+                    flush=True
+                )
                 continue
 
             candidate = {
                 "symbol": symbol,
-                "score": score,
+                "score": final_score,
+                "model_score": final_score,
+                "raw_score": score,
                 "ema_slope": ema_slope,
                 "rsi": rsi_1h,
                 "adx": adx_1h,
@@ -1616,6 +1864,14 @@ def scan_top_cryptos(
                     "fresh_signal_age": fresh_signal_age,
                     "timeframe_alignment": ",".join(timeframe_alignment_flags) if timeframe_alignment_flags else "",
                     "listing_age_days": listing_age_days,
+                    "penalties": "; ".join(penalty_notes) if penalty_notes else "",
+                    "volume_penalty": volume_penalty,
+                    "spread_penalty": spread_penalty,
+                    "depth_penalty": depth_penalty,
+                    "regime_ok": regime_ok,
+                    "regime_reason": regime_reason,
+                    "model_score": final_score,
+                    "raw_score": score,
                 }
             }
             candidates.append(candidate)
@@ -1677,6 +1933,7 @@ def scan_top_cryptos(
                 print(f"🔍 Top candidate: {symbol} | Score: {score}")
 
         if not candidates:
+            log_near_misses(near_miss_entries)
             if allow_fallback and fallback_volume < volume_threshold:
                 print(
                     f"ℹ️ No candidates found with volume ≥ {volume_threshold:,.0f}. "
@@ -1698,7 +1955,9 @@ def scan_top_cryptos(
         )
         top_candidates = candidates[:limit]
         log_scanner_snapshot(top_candidates)
-        print("✅ Scanner picks:", [(c['symbol'], c['score']) for c in top_candidates])
+        log_near_misses(near_miss_entries)
+        formatted_picks = [(c['symbol'], f"{c['score']:.2f}") for c in top_candidates]
+        print("✅ Scanner picks:", formatted_picks)
         return top_candidates
     except Exception as e:
         send_telegram_alert(f"❌ Enhanced scan error: {e}")
@@ -1708,9 +1967,9 @@ def scan_top_cryptos(
 def validate_entry_conditions(candidate: Optional[Dict[str, object]]) -> bool:
     if not candidate:
         return False
-    score_ok = candidate.get("score", 0) >= 5
+    score_ok = candidate.get("score", 0) >= MIN_CANDIDATE_SCORE
     rsi = candidate.get("rsi")
-    rsi_ok = isinstance(rsi, (int, float)) and 40 <= rsi <= 70
+    rsi_ok = isinstance(rsi, (int, float)) and 35 <= rsi <= 75
     return score_ok and rsi_ok
 
 

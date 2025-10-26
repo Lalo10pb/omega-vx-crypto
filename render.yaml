@@ -19,3 +19,8 @@ services:
         value: Crypto Portfolio Log
       - key: TRADE_SHEET_NAME
         value: Crypto Trade Log
+
+cronJobs:
+  - name: omega-vx-auto-tune
+    schedule: "30 4 * * *"
+    command: "python3 utils/auto_tune_env.py --env-file .env"
