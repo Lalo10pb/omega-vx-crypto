@@ -45,6 +45,10 @@ class AutoTuneConfig:
     backup_dir: Path = REPO_ROOT / "env" / "backups"
 
 
+class InsufficientSamplesError(RuntimeError):
+    """Raised when the log history is too small for meaningful tuning."""
+
+
 def _load_csv(path: Path, parse_dates: Optional[List[str]] = None) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
@@ -131,7 +135,7 @@ def compute_recommendations(
     notes: Dict[str, str] = {}
 
     if evaluation_df.empty or len(evaluation_df) < config.min_samples:
-        raise RuntimeError(
+        raise InsufficientSamplesError(
             f"Insufficient evaluation samples ({len(evaluation_df)}) "
             f"for auto-tuning (need ≥ {config.min_samples})."
         )
@@ -271,7 +275,13 @@ def run_auto_tune(config: AutoTuneConfig) -> None:
         ["quote_volume", "spread_pct", "depth_ratio", "atr_pct"],
     )
 
-    recommendations, notes = compute_recommendations(evaluation_df, near_miss_df, config)
+    try:
+        recommendations, notes = compute_recommendations(evaluation_df, near_miss_df, config)
+    except InsufficientSamplesError as err:
+        if config.verbose:
+            print(f"⚠️ {err}")
+            print("ℹ️ Auto-tune skipped; accumulate more evaluation data to resume.")
+        return
     updated, summary = apply_updates(config, recommendations)
 
     if config.verbose:
