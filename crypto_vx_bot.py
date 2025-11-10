@@ -60,6 +60,8 @@ ohlcv_cache: Dict[Tuple[str, str, int], Dict[str, object]] = {}
 
 regime_last_check: float = 0.0
 regime_last_result: Tuple[bool, str] = (True, "init")
+last_regime_warning_ts: float = 0.0
+last_regime_warning_reason: str = ""
 
 orderbook_cache: Dict[Tuple[str, float], Dict[str, object]] = {}
 listing_age_cache: Dict[str, Dict[str, float]] = {}
@@ -81,7 +83,7 @@ SCANNER_SNAPSHOT_PATH = os.getenv("SCANNER_SNAPSHOT_PATH", "scanner_snapshot_log
 SCANNER_MAX_CANDIDATES = max(int(os.getenv("SCANNER_MAX_CANDIDATES", 1)), 1)
 last_telegram_notify = datetime.now(timezone.utc) - timedelta(hours=12)  # Avoid spamming alerts
 last_loop_start_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-last_regime_metrics: Dict[str, float] = {}
+last_regime_metrics: Dict[str, object] = {}
 last_weekly_summary_date: Optional[str] = None
 last_portfolio_snapshot: float = 0.0
 MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", 900))
@@ -104,6 +106,10 @@ REGIME_EMA_SLOW = int(os.getenv("REGIME_EMA_SLOW", 50))
 REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", 180))
 REGIME_MIN_ROC = float(os.getenv("REGIME_MIN_ROC", 0.2))
 REGIME_CACHE_SECONDS = int(os.getenv("REGIME_CACHE_SECONDS", 300))
+REGIME_ROC_GRACE = max(float(os.getenv("REGIME_ROC_GRACE", 0.5)), 0.0)
+REGIME_EMA_GRACE_BARS = max(int(os.getenv("REGIME_EMA_GRACE_BARS", 3)), 1)
+REGIME_WARN_COOLDOWN_SECONDS = max(int(os.getenv("REGIME_WARN_COOLDOWN_SECONDS", 3600)), 0)
+REGIME_METRICS_LOG_PATH = os.getenv("REGIME_METRICS_LOG_PATH", "regime_metrics_log.csv")
 ORDERBOOK_CACHE_TTL_SECONDS = int(os.getenv("ORDERBOOK_CACHE_TTL_SECONDS", 30))
 DEPTH_ORDERBOOK_LIMIT = int(os.getenv("DEPTH_ORDERBOOK_LIMIT", 50))
 DEPTH_BAND_PERCENT = float(os.getenv("DEPTH_BAND_PERCENT", 0.5))
@@ -164,6 +170,47 @@ def ensure_directory(path: str) -> None:
 
 
 ensure_directory(LOGS_DIR)
+
+
+def log_regime_metrics_entry(
+    timestamp: datetime,
+    ema_fast: float,
+    ema_slow: float,
+    roc_value: float,
+    bullish: bool,
+    reason: str,
+    grace_active: bool,
+) -> None:
+    if not REGIME_METRICS_LOG_PATH:
+        return
+    log_dir = os.path.dirname(REGIME_METRICS_LOG_PATH)
+    if log_dir:
+        ensure_directory(log_dir)
+    try:
+        file_exists = os.path.exists(REGIME_METRICS_LOG_PATH)
+        with open(REGIME_METRICS_LOG_PATH, mode="a", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp",
+                    "ema_fast",
+                    "ema_slow",
+                    "roc_pct",
+                    "bullish",
+                    "grace_active",
+                    "reason",
+                ])
+            writer.writerow([
+                timestamp.isoformat(),
+                f"{ema_fast:.6f}",
+                f"{ema_slow:.6f}",
+                f"{roc_value:.6f}",
+                "1" if bullish else "0",
+                "1" if grace_active else "0",
+                reason,
+            ])
+    except Exception as err:
+        print(f"⚠️ Failed to log regime metrics: {err}")
 
 # === Helper Functions for EMA and RSI ===
 def calculate_ema(prices, period=20):
@@ -2021,21 +2068,48 @@ def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
     if roc_value is None:
         roc_value = 0.0
 
+    ema_grace_window = min(REGIME_EMA_GRACE_BARS, len(ema_fast_series), len(ema_slow_series))
+    ema_stack_consistent = (
+        ema_grace_window > 0 and
+        all(
+            fast_val > slow_val
+            for fast_val, slow_val in zip(
+                ema_fast_series[-ema_grace_window:],
+                ema_slow_series[-ema_grace_window:]
+            )
+        )
+    )
+    grace_active = False
+
     last_regime_metrics = {
         'ema_fast': float(ema_fast),
         'ema_slow': float(ema_slow),
         'roc': float(roc_value),
+        'grace_active': grace_active,
     }
 
     bullish = ema_fast > ema_slow and roc_value >= REGIME_MIN_ROC
+    if not bullish and REGIME_ROC_GRACE > 0 and ema_stack_consistent and roc_value >= -REGIME_ROC_GRACE:
+        bullish = True
+        grace_active = True
+        last_regime_metrics['grace_active'] = True
+
     if bullish:
-        reason = (
-            f"EMA{REGIME_EMA_FAST}>{REGIME_EMA_SLOW} ({ema_fast:.2f}>{ema_slow:.2f}) "
-            f"and ROC {roc_value:.2f}%"
-    )
+        if grace_active:
+            reason = (
+                f"EMA stack positive for {ema_grace_window} bars "
+                f"and ROC {roc_value:.2f}% within -{REGIME_ROC_GRACE:.2f}% grace band"
+            )
+        else:
+            reason = (
+                f"EMA{REGIME_EMA_FAST}>{REGIME_EMA_SLOW} ({ema_fast:.2f}>{ema_slow:.2f}) "
+                f"and ROC {roc_value:.2f}%"
+            )
     else:
-        condition = "EMA stack" if ema_fast <= ema_slow else "ROC"
-        # Custom regime defensive log and alert
+        if ema_fast <= ema_slow:
+            condition = "EMA stack"
+        else:
+            condition = "ROC"
         loop_label = last_loop_start_str or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         ema_21 = float(ema_fast)
         ema_55 = float(ema_slow)
@@ -2053,10 +2127,27 @@ def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
             f"Regime defensive: {condition} check failed "
             f"(EMA{REGIME_EMA_FAST}={ema_fast:.2f}, EMA{REGIME_EMA_SLOW}={ema_slow:.2f}, ROC={roc_value:.2f}%)"
         )
+        if (
+            condition == "ROC"
+            and REGIME_ROC_GRACE > 0
+            and roc_value < REGIME_MIN_ROC
+            and roc_value >= -REGIME_ROC_GRACE
+        ):
+            reason += f" (pending ROC recovery within {REGIME_ROC_GRACE:.2f}% grace band)"
 
     previous_state = regime_last_result[0] if regime_last_result else None
     regime_last_result = (bullish, reason)
     regime_last_check = now
+
+    log_regime_metrics_entry(
+        datetime.now(timezone.utc),
+        float(ema_fast),
+        float(ema_slow),
+        float(roc_value),
+        bullish,
+        reason,
+        grace_active,
+    )
 
     if previous_state is None or previous_state != bullish:
         status = "BULLISH" if bullish else "DEFENSIVE"
@@ -2084,20 +2175,32 @@ def calculate_position_size(
 
 # === MAIN LOOP ENTRY POINT ===
 def run_bot():
-    global last_loop_start_str, last_portfolio_snapshot
+    global last_loop_start_str, last_portfolio_snapshot, last_regime_warning_ts, last_regime_warning_reason
     log_event("info", "MainLoop", "Starting OMEGA-VX-CRYPTO loop…")
     send_telegram_alert("🚀 OMEGA-VX-CRYPTO bot started loop")
     while True:
         try:
             loop_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             last_loop_start_str = loop_start
-            monitor_positions()
 
             regime_ok, regime_reason = evaluate_market_regime()
             if not regime_ok:
-                log_event("warn", "MainLoop", f"Regime defensive: {regime_reason}")
+                if open_positions:
+                    monitor_positions()
+                now_ts = time.time()
+                warn_due = (
+                    REGIME_WARN_COOLDOWN_SECONDS == 0
+                    or (now_ts - last_regime_warning_ts) >= REGIME_WARN_COOLDOWN_SECONDS
+                    or regime_reason != last_regime_warning_reason
+                )
+                if warn_due:
+                    log_event("warn", "MainLoop", f"Regime defensive: {regime_reason}")
+                    last_regime_warning_ts = now_ts
+                    last_regime_warning_reason = regime_reason
                 time.sleep(config.LOOP_SLEEP_SECONDS)
                 continue
+
+            monitor_positions()
 
             try:
                 balance = exchange.fetch_balance()
