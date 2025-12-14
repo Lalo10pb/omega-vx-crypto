@@ -2238,6 +2238,17 @@ def evaluate_market_regime(force: bool = False) -> RegimeState:
     else:
         reasons.append("Price<EMA200")
 
+    # D. RSI Health (Max 10 pts)
+    is_oversold = rsi < 30
+    if 45 <= rsi <= 75:
+        score += 10
+        reasons.append(f"RSI Strong {rsi:.1f} (+10)")
+    elif is_oversold:
+        score += 20 
+        reasons.append(f"RSI Oversold {rsi:.1f} (+20)") # Potential bounce
+    elif rsi > 80:
+        reasons.append(f"RSI Overbought {rsi:.1f}")
+        
     # C. Momentum (ROC) (Max 20 pts)
     if roc_value > 0:
         roc_pts = min(roc_value * 2, 20)  # Cap at 20 (e.g., 10% ROC = 20pts)
@@ -2247,19 +2258,12 @@ def evaluate_market_regime(force: bool = False) -> RegimeState:
         # Mild negative ROC
         pass
     else:
-        # Strong negative ROC penalty
-        score -= 10
-        reasons.append(f"ROC -{roc_value:.2f}% (-10)")
-
-    # D. RSI Health (Max 10 pts)
-    if 45 <= rsi <= 75:
-        score += 10
-        reasons.append(f"RSI Strong {rsi:.1f} (+10)")
-    elif rsi < 30:
-        score += 5 
-        reasons.append(f"RSI Oversold {rsi:.1f} (+5)") # Potential bounce
-    elif rsi > 80:
-        reasons.append(f"RSI Overbought {rsi:.1f}")
+        # Strong negative ROC penalty (waived if oversold)
+        if not is_oversold:
+            score -= 10
+            reasons.append(f"ROC -{roc_value:.2f}% (-10)")
+        else:
+            reasons.append(f"ROC -{roc_value:.2f}% (Penalty waived due to Oversold)")
 
     # E. Trend Strength (ADX) (Max 20 pts)
     if adx > 25:
@@ -2268,8 +2272,15 @@ def evaluate_market_regime(force: bool = False) -> RegimeState:
             score += 20
             reasons.append(f"ADX Strong Trend {adx:.1f} (+20)")
         else:
-            score -= 20
-            reasons.append(f"ADX Strong Bear Trend {adx:.1f} (-20)")
+            if not is_oversold:
+                score -= 20
+                reasons.append(f"ADX Strong Bear Trend {adx:.1f} (-20)")
+            else:
+                reasons.append(f"ADX Strong Bear Trend {adx:.1f} (Penalty waived due to Oversold)")
+    else:
+        # Consolidation bonus: if market is quiet, we can trade mean reversion or range
+        score += 15
+        reasons.append(f"ADX Low/Consolidation {adx:.1f} (+15)")
     
     # Clamp score
     final_score = max(0.0, min(100.0, score))
@@ -2285,7 +2296,7 @@ def evaluate_market_regime(force: bool = False) -> RegimeState:
     elif final_score >= 40:
         status = "NEUTRAL"
         risk_scaler = 0.6
-    elif final_score >= 20:
+    elif final_score >= 15:
         status = "BEARISH_DEFENSIVE"
         risk_scaler = 0.3
     else:
