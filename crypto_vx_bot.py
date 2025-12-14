@@ -139,7 +139,7 @@ LISTING_AGE_CACHE_SECONDS = int(os.getenv("LISTING_AGE_CACHE_SECONDS", 3600))
 NEW_LISTING_BOOST_DAYS = int(os.getenv("NEW_LISTING_BOOST_DAYS", 30))
 RESTRICTED_SYMBOLS = {
     s.strip().upper()
-    for s in os.getenv("RESTRICTED_SYMBOLS", "EUR/USD,EUR/USDT,EUR/USDC").split(",")
+    for s in os.getenv("RESTRICTED_SYMBOLS", "EUR/USD,EUR/USDT,EUR/USDC,GBP/USD,AUD/USD,CAD/USD,JPY/USD").split(",")
     if s.strip()
 }
 # Nebraska/Regional restricted symbols (will be populated dynamically + defaults)
@@ -1919,7 +1919,13 @@ def scan_top_cryptos(
                         rsi_boost = alignment * SCORING_WEIGHTS.get("rsi", 0.0)
                         score += rsi_boost
                         reasons.append(f"RSI alignment ({rsi_1h:.1f}, +{rsi_boost:.2f})")
+                elif rsi_1h < 30:
+                    # Oversold condition - align with Regime improvement (Catch the bounce)
+                    bounce_boost = SCORING_WEIGHTS.get("rsi", 1.2) * 1.5
+                    score += bounce_boost
+                    reasons.append(f"RSI Oversold/Bounce ({rsi_1h:.1f}, +{bounce_boost:.2f})")
                 else:
+                    # Overbought (>80) or weak chop (30-35)
                     rsi_penalty = (min(abs(rsi_1h - 60.0), 40.0) / 40.0) * SCORING_WEIGHTS.get("rsi_penalty", 0.0)
                     penalty_total += rsi_penalty
                     penalty_notes.append(f"RSI penalty ({rsi_1h:.1f}, -{rsi_penalty:.2f})")
@@ -2159,7 +2165,7 @@ def validate_entry_conditions(candidate: Optional[Dict[str, object]]) -> bool:
         return False
     score_ok = candidate.get("score", 0) >= MIN_CANDIDATE_SCORE
     rsi = candidate.get("rsi")
-    rsi_ok = isinstance(rsi, (int, float)) and 35 <= rsi <= 75
+    rsi_ok = isinstance(rsi, (int, float)) and (rsi < 30 or 35 <= rsi <= 75)
     return score_ok and rsi_ok
 
 
