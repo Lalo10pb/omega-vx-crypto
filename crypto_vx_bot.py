@@ -4,8 +4,9 @@ import json
 import os
 import time
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from functools import lru_cache
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Set
 
 import gspread
 import numpy as np
@@ -35,6 +36,15 @@ class BotConfig:
     BOT_LOG_JSON: bool = os.getenv("BOT_LOG_JSON", "false").lower() == "true"
 
 
+@dataclass
+class RegimeState:
+    score: float
+    status: str
+    reason: str
+    can_trade: bool
+    risk_scaler: float
+
+
 config = BotConfig()
 
 
@@ -51,6 +61,7 @@ open_positions = set()
 open_positions_data = {}
 last_buy_time = defaultdict(lambda: 0)
 last_trade_time = defaultdict(lambda: 0)
+symbol_cooldowns = defaultdict(lambda: 0.0)
 COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 TRADE_COOLDOWN_SECONDS = 60 * 60  # 1 hour global cooldown per symbol
 
@@ -59,7 +70,14 @@ markets_last_load: float = 0.0
 ohlcv_cache: Dict[Tuple[str, str, int], Dict[str, object]] = {}
 
 regime_last_check: float = 0.0
-regime_last_result: Tuple[bool, str] = (True, "init")
+# Initialize with a safe default state
+regime_last_result: RegimeState = RegimeState(
+    score=50.0, 
+    status="INIT", 
+    reason="Initializing...", 
+    can_trade=True, 
+    risk_scaler=0.5
+)
 last_regime_warning_ts: float = 0.0
 last_regime_warning_reason: str = ""
 
@@ -86,6 +104,7 @@ last_loop_start_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 last_regime_metrics: Dict[str, object] = {}
 last_weekly_summary_date: Optional[str] = None
 last_portfolio_snapshot: float = 0.0
+last_health_heartbeat: float = 0.0
 MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", 900))
 OHLCV_CACHE_TTL_SECONDS = int(os.getenv("OHLCV_CACHE_TTL_SECONDS", 90))
 MULTI_TF_CACHE_TTL_SECONDS = int(os.getenv("MULTI_TF_CACHE_TTL_SECONDS", 300))
@@ -123,7 +142,17 @@ RESTRICTED_SYMBOLS = {
     for s in os.getenv("RESTRICTED_SYMBOLS", "EUR/USD,EUR/USDT,EUR/USDC").split(",")
     if s.strip()
 }
+# Nebraska/Regional restricted symbols (will be populated dynamically + defaults)
+RUNTIME_RESTRICTED_SYMBOLS: Set[str] = set()
+BLUE_CHIP_SYMBOLS = {
+    s.strip().upper()
+    for s in os.getenv("BLUE_CHIP_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,DOGE,ADA").split(",")
+    if s.strip()
+}
 PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS", 1800))
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "google_credentials.json")
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", 10800))
+SKIP_BOT_INIT = os.getenv("OMEGA_SKIP_INIT", "false").lower() == "true"
 
 SOFT_VOLUME_MULTIPLIER = float(os.getenv("SOFT_VOLUME_MULTIPLIER", 0.6))
 SOFT_SPREAD_BUFFER = float(os.getenv("SOFT_SPREAD_BUFFER", 0.15))
@@ -170,6 +199,68 @@ def ensure_directory(path: str) -> None:
 
 
 ensure_directory(LOGS_DIR)
+
+
+
+def validate_startup_config() -> None:
+    """Validate critical configuration to avoid running half-configured."""
+    errors: List[str] = []
+
+    if config.LOOP_SLEEP_SECONDS <= 0:
+        errors.append("LOOP_SLEEP_SECONDS must be > 0.")
+    if config.POSITION_CHECK_INTERVAL <= 0:
+        errors.append("POSITION_CHECK_INTERVAL must be > 0.")
+    if MAX_OPEN_POSITIONS <= 0:
+        errors.append("MAX_OPEN_POSITIONS must be > 0.")
+    if MAX_TOTAL_EXPOSURE_USD <= 0:
+        errors.append("MAX_TOTAL_EXPOSURE_USD must be > 0.")
+    if not (0 < RISK_PER_TRADE_PCT <= 1):
+        errors.append("RISK_PER_TRADE_PCT must be between 0 and 1 (fraction of equity).")
+    if HEARTBEAT_INTERVAL_SECONDS < 0:
+        errors.append("HEARTBEAT_INTERVAL_SECONDS cannot be negative.")
+
+    credentials_present = GOOGLE_CREDENTIALS_PATH and os.path.exists(GOOGLE_CREDENTIALS_PATH)
+    google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    portfolio_sheet_name = os.getenv("PORTFOLIO_SHEET_NAME")
+    if credentials_present:
+        if not google_sheet_id:
+            errors.append("GOOGLE_SHEET_ID is required when GOOGLE_CREDENTIALS_PATH is present.")
+        if not portfolio_sheet_name:
+            errors.append("PORTFOLIO_SHEET_NAME is required when GOOGLE_CREDENTIALS_PATH is present.")
+
+    if errors:
+        for err in errors:
+            log_event("error", "Config", err)
+        raise SystemExit("Startup validation failed; fix configuration and restart.")
+
+
+
+if not SKIP_BOT_INIT:
+    validate_startup_config()
+
+
+def call_with_retries(func, *args, attempts: int = 3, backoff: float = 1.5, base_delay: float = 0.5, **kwargs):
+    """
+    Small retry helper for exchange/network calls with exponential backoff.
+    Retries NetworkError/ExchangeError and RequestException.
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            return func(*args, **kwargs)
+        except (NetworkError, ExchangeError, requests.exceptions.RequestException) as err:
+            last_err = err
+            if attempt >= attempts:
+                break
+            sleep_s = base_delay * (backoff ** (attempt - 1))
+            log_event("warn", "Retry", f"{func.__name__} attempt {attempt}/{attempts} failed: {err}; retrying in {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+        except Exception as err:  # Non-retriable
+            last_err = err
+            break
+    if last_err:
+        raise last_err
+    return None
 
 
 def log_regime_metrics_entry(
@@ -379,7 +470,7 @@ def send_telegram_alert(message):
             "chat_id": chat_id,
             "text": message
         }
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
             print(f"⚠️ Telegram alert failed: {response.text}")
     except Exception as e:
@@ -404,48 +495,52 @@ def validate_exchange_credentials(name: str) -> None:
         exit(1)
 
 
-validate_exchange_credentials(exchange_name)
+exchange = None
+if not SKIP_BOT_INIT:
+    validate_exchange_credentials(exchange_name)
 
-if exchange_name == "bybit":
-    exchange = ccxt.bybit({
-        'apiKey': os.getenv("BYBIT_API_KEY"),
-        'secret': os.getenv("BYBIT_API_SECRET"),
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot',
-        }
-    })
-    if os.getenv("BYBIT_API_TESTNET", "false").lower() == "true":
-        exchange.set_sandbox_mode(True)
-    print("🪙 BYBIT TESTNET mode active.")
-    send_telegram_alert("🪙 BYBIT TESTNET mode active.")
-elif exchange_name == "kraken":
-    exchange = ccxt.kraken({
-        'apiKey': os.getenv("KRAKEN_API_KEY"),
-        'secret': os.getenv("KRAKEN_API_SECRET"),
-        'enableRateLimit': True,
-    })
-    print("🪙 KRAKEN LIVE mode active.")
-    send_telegram_alert("🪙 KRAKEN LIVE mode active.")
-else:
-    exchange = ccxt.okx({
-        'apiKey': os.getenv("OKX_API_KEY"),
-        'secret': os.getenv("OKX_API_SECRET"),
-        'password': os.getenv("OKX_API_PASSPHRASE"),
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot'
-        }
-    })
-    # Set sandbox mode according to OKX_API_TESTNET env variable
-    if os.getenv("OKX_API_TESTNET", "false").lower() == "true":
-        exchange.set_sandbox_mode(True)
-        print("🪙 OKX TESTNET mode active.")
-        send_telegram_alert("🪙 OKX TESTNET mode active.")
+    if exchange_name == "bybit":
+        exchange = ccxt.bybit({
+            'apiKey': os.getenv("BYBIT_API_KEY"),
+            'secret': os.getenv("BYBIT_API_SECRET"),
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot',
+            }
+        })
+        if os.getenv("BYBIT_API_TESTNET", "false").lower() == "true":
+            exchange.set_sandbox_mode(True)
+        print("🪙 BYBIT TESTNET mode active.")
+        send_telegram_alert("🪙 BYBIT TESTNET mode active.")
+    elif exchange_name == "kraken":
+        exchange = ccxt.kraken({
+            'apiKey': os.getenv("KRAKEN_API_KEY"),
+            'secret': os.getenv("KRAKEN_API_SECRET"),
+            'enableRateLimit': True,
+        })
+        print("🪙 KRAKEN LIVE mode active.")
+        send_telegram_alert("🪙 KRAKEN LIVE mode active.")
     else:
-        exchange.set_sandbox_mode(False)
-        print("🪙 OKX LIVE MODE active.")
-        send_telegram_alert("🪙 OKX LIVE MODE active.")
+        exchange = ccxt.okx({
+            'apiKey': os.getenv("OKX_API_KEY"),
+            'secret': os.getenv("OKX_API_SECRET"),
+            'password': os.getenv("OKX_API_PASSPHRASE"),
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot'
+            }
+        })
+        # Set sandbox mode according to OKX_API_TESTNET env variable
+        if os.getenv("OKX_API_TESTNET", "false").lower() == "true":
+            exchange.set_sandbox_mode(True)
+            print("🪙 OKX TESTNET mode active.")
+            send_telegram_alert("🪙 OKX TESTNET mode active.")
+        else:
+            exchange.set_sandbox_mode(False)
+            print("🪙 OKX LIVE MODE active.")
+            send_telegram_alert("🪙 OKX LIVE MODE active.")
+else:
+    print("⏸️ OMEGA_SKIP_INIT set; skipping exchange initialization.")
 
 
 # === Order Utility Helpers ===
@@ -507,7 +602,7 @@ def wait_for_order_fill(symbol: str, order: dict, timeout: int = 45, poll_interv
 
 # === Google Sheets Helper ===
 def load_bot_state() -> None:
-    global open_positions, open_positions_data, last_buy_time, last_trade_time
+    global open_positions, open_positions_data, last_buy_time, last_trade_time, symbol_cooldowns
     if not STATE_PATH or not os.path.exists(STATE_PATH):
         return
     try:
@@ -517,8 +612,10 @@ def load_bot_state() -> None:
         open_positions_data = data.get("open_positions_data", {}) or {}
         last_buy = {k: float(v) for k, v in (data.get("last_buy_time") or {}).items()}
         last_trade = {k: float(v) for k, v in (data.get("last_trade_time") or {}).items()}
+        cooldowns = {k: float(v) for k, v in (data.get("symbol_cooldowns") or {}).items()}
         last_buy_time = defaultdict(lambda: 0, last_buy)
         last_trade_time = defaultdict(lambda: 0, last_trade)
+        symbol_cooldowns = defaultdict(lambda: 0.0, cooldowns)
         print(f"🗂️ Restored bot state from {STATE_PATH}.")
     except Exception as err:
         print(f"⚠️ Failed to load bot state: {err}")
@@ -533,6 +630,7 @@ def save_bot_state() -> None:
             "open_positions_data": open_positions_data,
             "last_buy_time": {k: float(v) for k, v in last_buy_time.items()},
             "last_trade_time": {k: float(v) for k, v in last_trade_time.items()},
+            "symbol_cooldowns": {k: float(v) for k, v in symbol_cooldowns.items()},
         }
         with open(STATE_PATH, "w", encoding="utf-8") as state_file:
             json.dump(payload, state_file, ensure_ascii=True, indent=2)
@@ -543,12 +641,19 @@ def save_bot_state() -> None:
 def get_markets(force: bool = False) -> Dict[str, dict]:
     global markets_cache, markets_last_load
     now = time.time()
-    if force or not markets_cache or (now - markets_last_load) > MARKET_REFRESH_SECONDS:
+    cache_age = now - markets_last_load if markets_last_load else None
+    stale = cache_age is not None and cache_age > MARKET_REFRESH_SECONDS
+    if force or not markets_cache or stale:
         try:
-            markets_cache = exchange.load_markets()
+            markets_cache = call_with_retries(exchange.load_markets)
             markets_last_load = now
         except Exception as err:
-            print(f"⚠️ Failed to refresh markets: {err}")
+            if markets_cache:
+                age = now - markets_last_load if markets_last_load else 0
+                log_event("warn", "Markets", f"Using stale markets cache (age {age:.0f}s) after refresh failure: {err}")
+            else:
+                log_event("error", "Markets", f"Failed to load markets: {err}")
+                raise
     return markets_cache
 
 
@@ -558,23 +663,34 @@ def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int, ttl: Optional[in
     key = (symbol, timeframe, limit)
     now = time.time()
     cached = ohlcv_cache.get(key)
-    if cached and now - cached['ts'] < ttl:
+    cached_age = (now - cached['ts']) if cached else None
+    if cached and cached_age is not None and cached_age < ttl:
         return cached['data']
-    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    ohlcv_cache[key] = {'ts': now, 'data': data}
-    return data
+    try:
+        data = call_with_retries(exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
+        ohlcv_cache[key] = {'ts': now, 'data': data}
+        return data
+    except Exception as err:
+        if cached:
+            log_event("warn", "DataCache", f"Returning stale OHLCV for {symbol} {timeframe} (age {cached_age:.0f}s): {err}")
+            return cached['data']
+        raise
 
 
 def fetch_orderbook_metrics(symbol: str, depth_percent: float = DEPTH_BAND_PERCENT) -> Dict[str, float]:
     key = (symbol, depth_percent)
     now = time.time()
     cached = orderbook_cache.get(key)
-    if cached and (now - cached.get('timestamp', 0.0)) < ORDERBOOK_CACHE_TTL_SECONDS:
+    cached_age = (now - cached.get('timestamp', 0.0)) if cached else None
+    if cached and cached_age is not None and cached_age < ORDERBOOK_CACHE_TTL_SECONDS:
         return cached
 
     try:
-        orderbook = exchange.fetch_order_book(symbol, limit=DEPTH_ORDERBOOK_LIMIT)
+        orderbook = call_with_retries(exchange.fetch_order_book, symbol, limit=DEPTH_ORDERBOOK_LIMIT)
     except Exception as err:
+        if cached:
+            log_event("warn", "OrderBook", f"Returning stale depth for {symbol} (age {cached_age:.0f}s): {err}")
+            return cached
         print(f"⚠️ Failed to fetch order book for {symbol}: {err}")
         return {}
 
@@ -723,16 +839,23 @@ def current_total_exposure() -> float:
     return float(exposure)
 
 
-load_bot_state()
-get_markets(force=True)
+if not SKIP_BOT_INIT:
+    load_bot_state()
+    get_markets(force=True)
 
 
+@lru_cache(maxsize=1)
 def get_gspread_client():
+    """Authorize once and reuse the Sheets client to avoid repeated file I/O."""
+    if not GOOGLE_CREDENTIALS_PATH:
+        return None
+    if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
+        log_event("warn", "sheets", f"Google credentials not found at {GOOGLE_CREDENTIALS_PATH}; disabling sheet logging.")
+        return None
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
-        client = gspread.authorize(creds)
-        return client
+        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
+        return gspread.authorize(creds)
     except Exception as e:
         send_telegram_alert(f"❌ Google Sheets auth error: {str(e)}")
         return None
@@ -847,7 +970,7 @@ def log_portfolio_snapshot():
         usd = 0
         total = 0
         try:
-            balance = exchange.fetch_balance()
+            balance = call_with_retries(exchange.fetch_balance)
             balance_total = balance.get('total', {})
             print("💰 Kraken Balance Keys:", list(balance_total.keys()))
             usd = balance_total.get('ZUSD', balance_total.get('USD', 0))
@@ -966,7 +1089,7 @@ def log_portfolio_snapshot():
         unrealized = 0.0
         try:
             for sym, pos in open_positions_data.items():
-                ticker = exchange.fetch_ticker(sym)
+                ticker = call_with_retries(exchange.fetch_ticker, sym)
                 last_price = ticker.get("last") or ticker.get("close") or 0
                 if isinstance(last_price, (int, float)):
                     entry_price = pos.get("entry_price", 0)
@@ -1005,6 +1128,13 @@ def execute_trade(
             print(reason)
             send_telegram_alert(reason)
             return None
+        cooldown_until_ts = symbol_cooldowns.get(symbol, 0.0)
+        if cooldown_until_ts and now < cooldown_until_ts:
+            wait_min = int((cooldown_until_ts - now) / 60)
+            reason = f"⏳ Trade rejected: cooldown active for {symbol} ({wait_min} min remaining)."
+            print(reason)
+            send_telegram_alert(reason)
+            return None
         if now - last_buy_time[symbol] < COOLDOWN_SECONDS:
             wait_time = int(COOLDOWN_SECONDS - (now - last_buy_time[symbol])) // 60
             reason = f"⏳ Trade rejected: cooldown active for {symbol} ({wait_time} min remaining)."
@@ -1024,7 +1154,7 @@ def execute_trade(
         return None
 
     try:
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = call_with_retries(exchange.fetch_ticker, symbol)
         reference_price = extract_valid_price(ticker)
         if reference_price is None:
             message = f"⚠️ No valid price data available for {symbol}; skipping {side} order."
@@ -1038,7 +1168,7 @@ def execute_trade(
             return None
 
         try:
-            order_book = exchange.fetch_order_book(symbol, limit=10)
+            order_book = call_with_retries(exchange.fetch_order_book, symbol, limit=10)
         except Exception as book_err:
             message = f"⚠️ Failed to fetch order book for {symbol}: {book_err}"
             log_event("warn", "TradeEngine", message)
@@ -1180,6 +1310,7 @@ def execute_trade(
             )
 
         last_trade_time[symbol] = now
+        symbol_cooldowns[symbol] = now + TRADE_COOLDOWN_SECONDS
         if side == "buy":
             last_buy_time[symbol] = now
             open_positions.add(symbol)
@@ -1431,6 +1562,7 @@ def extract_quote_volume(ticker: Dict) -> Optional[float]:
 
 
 def scan_top_cryptos(
+    regime_state: RegimeState,
     limit: int = 5,
     quote_asset: Optional[str] = None,
     min_volume: Optional[float] = None,
@@ -1438,7 +1570,7 @@ def scan_top_cryptos(
 ) -> List[Dict[str, object]]:
     try:
         quote_asset = (quote_asset or DEFAULT_QUOTE_ASSET).upper()
-        print(f"🔍 Scanning {exchange_name.upper()} {quote_asset} markets with enhanced filters...")
+        print(f"🔍 Scanning {exchange_name.upper()} {quote_asset} markets with enhanced filters (Regime Score: {regime_state.score})...")
         markets = get_markets()
         candidates: List[Dict[str, object]] = []
         symbol_suffix = f"/{quote_asset}"
@@ -1460,9 +1592,6 @@ def scan_top_cryptos(
         soft_depth_ratio = max(0.0, MIN_DEPTH_IMBALANCE - SOFT_DEPTH_BUFFER)
         near_miss_entries: List[Dict[str, object]] = []
 
-        regime_ok, regime_reason = evaluate_market_regime()
-        regime_state = "bull" if regime_ok else "bear"
-
         def record_near_miss(symbol_name: str, reason: str, extra: Optional[Dict[str, object]] = None) -> None:
             payload: Dict[str, object] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1474,7 +1603,7 @@ def scan_top_cryptos(
                 "soft_spread_limit": soft_spread_limit,
                 "min_depth_imbalance": MIN_DEPTH_IMBALANCE,
                 "soft_depth_ratio": soft_depth_ratio,
-                "regime_state": regime_state,
+                "regime_state": regime_state.status,
             }
             if extra:
                 payload.update(extra)
@@ -1489,8 +1618,9 @@ def scan_top_cryptos(
             print(f"🚫 Skipping {symbol_name} — {reason}", flush=True)
 
         for symbol, market in tickers:
-            if symbol.upper() in RESTRICTED_SYMBOLS:
-                log_skip(symbol, "restricted symbol")
+            if symbol.upper() in RESTRICTED_SYMBOLS or symbol.upper() in RUNTIME_RESTRICTED_SYMBOLS:
+                # Silent skip for blacklist to reduce noise, unless DEBUG
+                # log_skip(symbol, "restricted symbol")
                 continue
             market_quote = (market or {}).get('quote')
             if market_quote:
@@ -1506,8 +1636,12 @@ def scan_top_cryptos(
                 continue
 
             try:
-                ticker = exchange.fetch_ticker(symbol)
+                ticker = call_with_retries(exchange.fetch_ticker, symbol)
             except Exception as fetch_err:
+                err_str = str(fetch_err).lower()
+                if "restricted" in err_str or "permission denied" in err_str or "service unavailable" in err_str:
+                    print(f"⚠️ Flagging {symbol} as restricted/unavailable: {fetch_err}")
+                    RUNTIME_RESTRICTED_SYMBOLS.add(symbol.upper())
                 log_skip(symbol, f"ticker fetch failed ({fetch_err})")
                 continue
 
@@ -1759,12 +1893,12 @@ def scan_top_cryptos(
                 if note:
                     penalty_notes.append(note)
 
-            if regime_ok:
+            if regime_state.status == "BULLISH":
                 score += SCORING_WEIGHTS.get("regime_bull", 0.0)
                 reasons.append("Regime aligned (bullish bias)")
-            else:
+            elif regime_state.status == "BEARISH_DEFENSIVE":
                 penalty_total += SCORING_WEIGHTS.get("regime_bear", 0.0)
-                penalty_notes.append(f"Regime headwind: {regime_reason}")
+                penalty_notes.append(f"Regime headwind: {regime_state.reason}")
 
             if ema9 > ema21 > ema50:
                 stack_weight = SCORING_WEIGHTS.get("ema_stack", 0.0)
@@ -1845,6 +1979,14 @@ def scan_top_cryptos(
                 score += listing_boost
                 reasons.append(f"Fresh Kraken listing (~{listing_age_days:.1f}d, +{listing_boost:.2f})")
 
+            # Blue Chip Boost
+            base_currency = symbol.split('/')[0]
+            if base_currency in BLUE_CHIP_SYMBOLS:
+                # 20% boost for blue chips
+                bc_boost = 1.5 
+                score += bc_boost
+                reasons.append(f"Blue Chip Asset (+{bc_boost:.2f})")
+
             ema_slope = (ema9 - ema21) / ema21 if ema21 else 0.0
             if ema_slope > 0:
                 slope_strength = min(ema_slope / 0.03, 1.0)
@@ -1915,8 +2057,8 @@ def scan_top_cryptos(
                     "volume_penalty": volume_penalty,
                     "spread_penalty": spread_penalty,
                     "depth_penalty": depth_penalty,
-                    "regime_ok": regime_ok,
-                    "regime_reason": regime_reason,
+                    "regime_ok": regime_state.can_trade,
+                    "regime_reason": regime_state.reason,
                     "model_score": final_score,
                     "raw_score": score,
                 }
@@ -1991,6 +2133,7 @@ def scan_top_cryptos(
                     quote_asset=quote_asset,
                     min_volume=fallback_volume,
                     allow_fallback=False,
+                    regime_state=regime_state
                 )
             return []
 
@@ -2020,13 +2163,14 @@ def validate_entry_conditions(candidate: Optional[Dict[str, object]]) -> bool:
     return score_ok and rsi_ok
 
 
-def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
-    global regime_last_check, regime_last_result, last_regime_metrics, last_loop_start_str
+def evaluate_market_regime(force: bool = False) -> RegimeState:
+    global regime_last_check, regime_last_result, last_regime_metrics
     now = time.time()
-    if not force and (now - regime_last_check) < REGIME_CACHE_SECONDS and regime_last_result is not None:
+    if not force and (now - regime_last_check) < REGIME_CACHE_SECONDS and regime_last_result.status != "INIT":
         return regime_last_result
 
-    minimum_required = max(REGIME_LOOKBACK // 2, REGIME_EMA_SLOW * 3)
+    # 1. Fetch Regime Data (BTC/USD usually)
+    minimum_required = max(REGIME_LOOKBACK // 2, REGIME_EMA_SLOW * 4)
     try:
         ohlcv = fetch_ohlcv_cached(
             REGIME_SYMBOL,
@@ -2035,145 +2179,197 @@ def evaluate_market_regime(force: bool = False) -> Tuple[bool, str]:
             ttl=REGIME_CACHE_SECONDS,
         )
     except Exception as err:
-        reason = f"Regime check failed: {err}"
-        regime_last_result = (False, reason)
         regime_last_check = now
-        return regime_last_result
+        # Return previous state if valid, else defensive
+        if regime_last_result.status != "INIT":
+            return regime_last_result
+        return RegimeState(0.0, "ERROR", f"Fetch failed: {err}", False, 0.0)
 
     if not ohlcv or len(ohlcv) < minimum_required:
-        reason = "Insufficient regime OHLCV data"
-        regime_last_result = (False, reason)
         regime_last_check = now
-        return regime_last_result
+        return RegimeState(0.0, "ERROR", "Insufficient regime OHLCV", False, 0.0)
 
     closes = [c[4] for c in ohlcv if isinstance(c[4], (int, float)) and c[4] > 0]
-    if len(closes) < minimum_required:
-        reason = "Regime close data invalid"
-        regime_last_result = (False, reason)
-        regime_last_check = now
-        return regime_last_result
-
+    highs = [c[2] for c in ohlcv]
+    lows = [c[3] for c in ohlcv]
+    
+    # 2. Calculate Indicators
     ema_fast_series = calculate_ema_series(closes, REGIME_EMA_FAST)
     ema_slow_series = calculate_ema_series(closes, REGIME_EMA_SLOW)
+    ema_200_series = calculate_ema_series(closes, 200)
+    
     if not ema_fast_series or not ema_slow_series:
-        reason = "Regime EMA data missing"
-        regime_last_result = (False, reason)
         regime_last_check = now
-        return regime_last_result
+        return RegimeState(0.0, "ERROR", "Insufficient EMA data", False, 0.0)
 
+    current_price = closes[-1]
     ema_fast = ema_fast_series[-1]
     ema_slow = ema_slow_series[-1]
-    roc_period = min(max(REGIME_EMA_SLOW, 10), len(closes) - 2)
-    roc_value = rate_of_change(closes, period=roc_period)
-    if roc_value is None:
-        roc_value = 0.0
+    ema_200 = ema_200_series[-1] if ema_200_series else current_price
+    
+    # ROC
+    roc_period = 10
+    roc_value = rate_of_change(closes, period=roc_period) or 0.0
+    
+    # RSI
+    rsi_vals = calculate_rsi(closes)
+    rsi = rsi_vals[-1] if rsi_vals else 50.0
+    
+    # ADX
+    adx_vals = calculate_adx(highs, lows, closes)
+    adx = adx_vals[-1] if adx_vals else 20.0
 
-    ema_grace_window = min(REGIME_EMA_GRACE_BARS, len(ema_fast_series), len(ema_slow_series))
-    ema_stack_consistent = (
-        ema_grace_window > 0 and
-        all(
-            fast_val > slow_val
-            for fast_val, slow_val in zip(
-                ema_fast_series[-ema_grace_window:],
-                ema_slow_series[-ema_grace_window:]
-            )
-        )
-    )
-    grace_active = False
+    # 3. Calculate Score (0-100)
+    score = 0.0
+    reasons = []
 
-    last_regime_metrics = {
-        'ema_fast': float(ema_fast),
-        'ema_slow': float(ema_slow),
-        'roc': float(roc_value),
-        'grace_active': grace_active,
-    }
-
-    bullish = ema_fast > ema_slow and roc_value >= REGIME_MIN_ROC
-    if not bullish and REGIME_ROC_GRACE > 0 and ema_stack_consistent and roc_value >= -REGIME_ROC_GRACE:
-        bullish = True
-        grace_active = True
-        last_regime_metrics['grace_active'] = True
-
-    if bullish:
-        if grace_active:
-            reason = (
-                f"EMA stack positive for {ema_grace_window} bars "
-                f"and ROC {roc_value:.2f}% within -{REGIME_ROC_GRACE:.2f}% grace band"
-            )
-        else:
-            reason = (
-                f"EMA{REGIME_EMA_FAST}>{REGIME_EMA_SLOW} ({ema_fast:.2f}>{ema_slow:.2f}) "
-                f"and ROC {roc_value:.2f}%"
-            )
+    # A. EMA Structure (Max 30 pts)
+    if ema_fast > ema_slow:
+        score += 30
+        reasons.append("EMA Fast>Slow (+30)")
     else:
-        if ema_fast <= ema_slow:
-            condition = "EMA stack"
+        # Penalize dead cross
+        reasons.append("EMA Fast<Slow")
+
+    # B. Long Term Trend (Max 20 pts)
+    if current_price > ema_200:
+        score += 20
+        reasons.append("Price>EMA200 (+20)")
+    else:
+        reasons.append("Price<EMA200")
+
+    # C. Momentum (ROC) (Max 20 pts)
+    if roc_value > 0:
+        roc_pts = min(roc_value * 2, 20)  # Cap at 20 (e.g., 10% ROC = 20pts)
+        score += roc_pts
+        reasons.append(f"ROC +{roc_value:.2f}% (+{roc_pts:.1f})")
+    elif roc_value > -2.0:
+        # Mild negative ROC
+        pass
+    else:
+        # Strong negative ROC penalty
+        score -= 10
+        reasons.append(f"ROC -{roc_value:.2f}% (-10)")
+
+    # D. RSI Health (Max 10 pts)
+    if 45 <= rsi <= 75:
+        score += 10
+        reasons.append(f"RSI Strong {rsi:.1f} (+10)")
+    elif rsi < 30:
+        score += 5 
+        reasons.append(f"RSI Oversold {rsi:.1f} (+5)") # Potential bounce
+    elif rsi > 80:
+        reasons.append(f"RSI Overbought {rsi:.1f}")
+
+    # E. Trend Strength (ADX) (Max 20 pts)
+    if adx > 25:
+        # Only bullish if trend is up (EMA aligned), otherwise strong bear trend!
+        if ema_fast > ema_slow:
+            score += 20
+            reasons.append(f"ADX Strong Trend {adx:.1f} (+20)")
         else:
-            condition = "ROC"
-        loop_label = last_loop_start_str or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        ema_21 = float(ema_fast)
-        ema_55 = float(ema_slow)
-        roc = float(roc_value)
-        print(
-            f"🛡️ Regime defensive at {loop_label}: EMA21={ema_21:.2f}, "
-            f"EMA55={ema_55:.2f}, ROC={roc:.2f}%",
-            flush=True
-        )
-        global last_telegram_notify
-        if datetime.now(timezone.utc) - last_telegram_notify > timedelta(hours=3):
-            send_telegram_alert(f"⚠️ Omega-Crypto standing down: Weak trend regime (EMA21={ema_fast:.2f}, EMA55={ema_slow:.2f}, ROC={roc_value:.2f}%).")
-            last_telegram_notify = datetime.now(timezone.utc)
-        reason = (
-            f"Regime defensive: {condition} check failed "
-            f"(EMA{REGIME_EMA_FAST}={ema_fast:.2f}, EMA{REGIME_EMA_SLOW}={ema_slow:.2f}, ROC={roc_value:.2f}%)"
-        )
-        if (
-            condition == "ROC"
-            and REGIME_ROC_GRACE > 0
-            and roc_value < REGIME_MIN_ROC
-            and roc_value >= -REGIME_ROC_GRACE
-        ):
-            reason += f" (pending ROC recovery within {REGIME_ROC_GRACE:.2f}% grace band)"
+            score -= 20
+            reasons.append(f"ADX Strong Bear Trend {adx:.1f} (-20)")
+    
+    # Clamp score
+    final_score = max(0.0, min(100.0, score))
 
-    previous_state = regime_last_result[0] if regime_last_result else None
-    regime_last_result = (bullish, reason)
-    regime_last_check = now
+    # 4. Determine State & Risk Scaler
+    status = "NEUTRAL"
+    can_trade = True
+    risk_scaler = 0.5
+    
+    if final_score >= 70:
+        status = "BULLISH"
+        risk_scaler = 1.0
+    elif final_score >= 40:
+        status = "NEUTRAL"
+        risk_scaler = 0.6
+    elif final_score >= 20:
+        status = "BEARISH_DEFENSIVE"
+        risk_scaler = 0.3
+    else:
+        status = "CRITICAL"
+        can_trade = False
+        risk_scaler = 0.0
 
-    log_regime_metrics_entry(
-        datetime.now(timezone.utc),
-        float(ema_fast),
-        float(ema_slow),
-        float(roc_value),
-        bullish,
-        reason,
-        grace_active,
+    reason_str = f"Score {final_score:.0f}/100: " + ", ".join(reasons)
+    
+    # Log logic
+    previous_score = regime_last_result.score if regime_last_result.status != "INIT" else -1
+    if abs(final_score - previous_score) > 5 or status != regime_last_result.status:
+        send_telegram_alert(f"🧭 Regime Update: {status} ({final_score:.0f}/100)\n{reason_str}")
+
+    regime_last_result = RegimeState(
+        score=final_score,
+        status=status,
+        reason=reason_str,
+        can_trade=can_trade,
+        risk_scaler=risk_scaler
     )
-
-    if previous_state is None or previous_state != bullish:
-        status = "BULLISH" if bullish else "DEFENSIVE"
-        send_telegram_alert(f"🧭 Market regime -> {status}: {reason}")
-
+    regime_last_check = now
+    
+    # Store metrics for logging
+    last_regime_metrics = {
+        'ema_fast': ema_fast,
+        'ema_slow': ema_slow,
+        'roc': roc_value,
+        'score': final_score,
+        'status': status
+    }
+    
     return regime_last_result
 
 
 def calculate_position_size(
     candidate: Dict[str, object],
-    quote_budget: float
+    quote_budget: float,
+    risk_scaler: float = 1.0
 ) -> float:
     """Derive a position size (base units) from a quote notional budget and candidate data."""
     price = candidate.get("price")
     if not isinstance(price, (int, float)) or price <= 0:
         return 0.0
+    
+    # Scale budget by regime risk
+    effective_budget = quote_budget * risk_scaler
+    
     exposure_cap_remaining = max(MAX_TOTAL_EXPOSURE_USD - current_total_exposure(), 0.0)
     if exposure_cap_remaining <= 0:
         return 0.0
-    trade_notional = min(max(quote_budget, 0.0), exposure_cap_remaining)
+    trade_notional = min(max(effective_budget, 0.0), exposure_cap_remaining)
     trade_notional = min(trade_notional, exposure_cap_remaining)
     if trade_notional <= 0:
         return 0.0
     return trade_notional / price
 
 # === MAIN LOOP ENTRY POINT ===
+def maybe_send_health_heartbeat(regime_state: RegimeState) -> None:
+    """Emit a periodic heartbeat to Telegram so stalls are visible quickly."""
+    global last_health_heartbeat
+    if HEARTBEAT_INTERVAL_SECONDS <= 0:
+        return
+    now_ts = time.time()
+    if last_health_heartbeat and (now_ts - last_health_heartbeat) < HEARTBEAT_INTERVAL_SECONDS:
+        return
+
+    regime_label = regime_state.status
+    exposure = current_total_exposure()
+    message = (
+        "⏱️ Omega heartbeat\n"
+        f"Loop @ {last_loop_start_str}\n"
+        f"Regime: {regime_label} ({regime_state.score:.0f}/100)\n"
+        f"Open positions: {len(open_positions)} | Exposure ${exposure:.2f}\n"
+        f"Cooldowns tracked: {len(symbol_cooldowns)}\n"
+        f"Restricted Symbols: {len(RUNTIME_RESTRICTED_SYMBOLS)}"
+    )
+    if regime_state.reason:
+        message += f"\nReason: {regime_state.reason}"
+
+    send_telegram_alert(message)
+    last_health_heartbeat = now_ts
+
+
 def run_bot():
     global last_loop_start_str, last_portfolio_snapshot, last_regime_warning_ts, last_regime_warning_reason
     log_event("info", "MainLoop", "Starting OMEGA-VX-CRYPTO loop…")
@@ -2183,27 +2379,30 @@ def run_bot():
             loop_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             last_loop_start_str = loop_start
 
-            regime_ok, regime_reason = evaluate_market_regime()
-            if not regime_ok:
+            regime_state = evaluate_market_regime()
+            
+            # Use can_trade flag from graded regime logic
+            if not regime_state.can_trade:
                 if open_positions:
                     monitor_positions()
                 now_ts = time.time()
                 warn_due = (
                     REGIME_WARN_COOLDOWN_SECONDS == 0
                     or (now_ts - last_regime_warning_ts) >= REGIME_WARN_COOLDOWN_SECONDS
-                    or regime_reason != last_regime_warning_reason
+                    or regime_state.status != last_regime_warning_reason
                 )
                 if warn_due:
-                    log_event("warn", "MainLoop", f"Regime defensive: {regime_reason}")
+                    log_event("warn", "MainLoop", f"Regime Critical: {regime_state.reason}")
                     last_regime_warning_ts = now_ts
-                    last_regime_warning_reason = regime_reason
+                    last_regime_warning_reason = regime_state.status
+                maybe_send_health_heartbeat(regime_state)
                 time.sleep(config.LOOP_SLEEP_SECONDS)
                 continue
 
             monitor_positions()
 
             try:
-                balance = exchange.fetch_balance()
+                balance = call_with_retries(exchange.fetch_balance)
                 free_balances = balance.get('free') or {}
                 quote_asset, quote_available = pick_quote_balance(free_balances)
             except Exception as balance_err:
@@ -2214,7 +2413,11 @@ def run_bot():
             quote_budget = max(quote_available * 0.95, 0.0)
             per_trade_cap = quote_available * RISK_PER_TRADE_PCT
 
-            candidates = scan_top_cryptos(limit=SCANNER_MAX_CANDIDATES, quote_asset=quote_asset)
+            candidates = scan_top_cryptos(
+                regime_state=regime_state,
+                limit=SCANNER_MAX_CANDIDATES, 
+                quote_asset=quote_asset
+            )
             if not candidates:
                 log_event("info", "MainLoop", "No valid candidates this cycle.")
                 time.sleep(config.LOOP_SLEEP_SECONDS)
@@ -2233,7 +2436,11 @@ def run_bot():
                     break
 
                 trade_notional = min(quote_budget, per_trade_cap)
-                position_size = calculate_position_size(candidate, trade_notional)
+                position_size = calculate_position_size(
+                    candidate, 
+                    trade_notional, 
+                    risk_scaler=regime_state.risk_scaler
+                )
                 if position_size <= 0:
                     continue
 
@@ -2271,6 +2478,7 @@ def run_bot():
                 log_portfolio_snapshot()
                 last_portfolio_snapshot = now_ts
 
+            maybe_send_health_heartbeat(regime_state)
             time.sleep(config.LOOP_SLEEP_SECONDS)
         except (NetworkError, ExchangeError) as loop_err:
             log_event("warn", "MainLoop", f"Exchange connectivity issue: {loop_err}")
@@ -2281,4 +2489,7 @@ def run_bot():
 
 
 if __name__ == "__main__":
-    run_bot()
+    if SKIP_BOT_INIT:
+        print("OMEGA_SKIP_INIT active; skipping bot runtime.")
+    else:
+        run_bot()
