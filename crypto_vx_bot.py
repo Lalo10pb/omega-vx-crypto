@@ -2,7 +2,11 @@ import ccxt
 import csv
 import json
 import os
+import sys
 import time
+
+# Force unbuffered output for Render logs
+sys.stdout.reconfigure(line_buffering=True)
 from collections import defaultdict
 from functools import lru_cache
 from dataclasses import dataclass, field
@@ -841,6 +845,7 @@ def current_total_exposure() -> float:
 
 if not SKIP_BOT_INIT:
     load_bot_state()
+    print("🔄 Initializing markets...", flush=True)
     get_markets(force=True)
 
 
