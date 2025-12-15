@@ -2023,10 +2023,15 @@ def scan_top_cryptos(
                 flush=True
             )
 
-            if final_score < MIN_CANDIDATE_SCORE:
+            # Adjust threshold for defensive regime to allow high-quality mean reversion
+            effective_min_score = MIN_CANDIDATE_SCORE
+            if regime_state.status == "BEARISH_DEFENSIVE":
+                effective_min_score = max(MIN_CANDIDATE_SCORE - 1.5, 1.5)
+
+            if final_score < effective_min_score:
                 print(
                     f"⏭️ Skipped {symbol}: Did not pass smart-score filter "
-                    f"(score={final_score:.2f} < {MIN_CANDIDATE_SCORE:.2f})",
+                    f"(score={final_score:.2f} < {effective_min_score:.2f})",
                     flush=True
                 )
                 continue
