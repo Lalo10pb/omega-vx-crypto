@@ -2012,9 +2012,30 @@ def scan_top_cryptos(
                     score += volatility_boost
                     reasons.append(f"Contained volatility ({atr_pct*100:.2f}%, +{volatility_boost:.2f})")
 
-            final_score = max(score - penalty_total, 0.0)
-            if penalty_notes:
-                reasons.extend(f"⚠️ {note}" for note in penalty_notes)
+            # === SNIPER LOGIC ===
+            # Detect high-quality counter-trend setups (Oversold + Volume)
+            is_sniper_setup = False
+            if isinstance(rsi_1h, (int, float)) and rsi_1h < 30:
+                 # Check for volume capitulation/strength
+                 if volume_ratio and volume_ratio > 1.2:
+                     is_sniper_setup = True
+            
+            if is_sniper_setup:
+                # WAIVE PENALTIES for trend/regime because we are betting on a reversal
+                reasons.append("🎯 SNIPER SETUP DETECTED (Penalties Waived)")
+                # Applying a massive boost to ensure it clears the 4.0 hurdle if everything else is decent
+                sniper_boost = 3.0
+                score += sniper_boost
+                reasons.append(f"Sniper Boost (+{sniper_boost:.1f})")
+                
+                # We do NOT add penalty_total to the final score calculation for these setups
+                # effectively ignoring trend headwinds
+                final_score = max(score, 0.0) 
+            else:
+                # Standard Logic
+                final_score = max(score - penalty_total, 0.0)
+                if penalty_notes:
+                    reasons.extend(f"⚠️ {note}" for note in penalty_notes)
 
             volatility = atr_pct or 0.0
             print(
@@ -2023,15 +2044,10 @@ def scan_top_cryptos(
                 flush=True
             )
 
-            # Adjust threshold for defensive regime to allow high-quality mean reversion
-            effective_min_score = MIN_CANDIDATE_SCORE
-            if regime_state.status == "BEARISH_DEFENSIVE":
-                effective_min_score = max(MIN_CANDIDATE_SCORE - 1.5, 1.5)
-
-            if final_score < effective_min_score:
+            if final_score < MIN_CANDIDATE_SCORE:
                 print(
                     f"⏭️ Skipped {symbol}: Did not pass smart-score filter "
-                    f"(score={final_score:.2f} < {effective_min_score:.2f})",
+                    f"(score={final_score:.2f} < {MIN_CANDIDATE_SCORE:.2f})",
                     flush=True
                 )
                 continue
