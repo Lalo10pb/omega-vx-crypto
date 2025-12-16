@@ -2336,7 +2336,7 @@ def evaluate_market_regime(force: bool = False) -> RegimeState:
         can_trade = False
         risk_scaler = 0.0
 
-    reason_str = f"Score {final_score:.0f}/100: " + ", ".join(reasons)
+    reason_str = f"Score {final_score:.0f}/100 (RSI {rsi:.1f}): " + ", ".join(reasons)
     
     # Log logic
     previous_score = regime_last_result.score if regime_last_result.status != "INIT" else -1
